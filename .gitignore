@@ -1,0 +1,45 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Logs and runtime outputs
+*.log
+app_debug.log
+
+# Media / heavy audio & video test files (e.g. sample meeting recordings)
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.wav
+*.mp3
+*.flac
+meeting_logs/*.mp4
+meeting_logs/*.mkv
+meeting_logs/*.avi
+meeting_logs/*.mov
+meeting_logs/*.webm
+meeting_logs/*.wav
+meeting_logs/*.mp3
+
+# Scratch & test caches
+.pytest_cache/
+.coverage
+htmlcov/
+scratch/
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
