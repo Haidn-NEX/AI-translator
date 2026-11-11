@@ -88,8 +88,16 @@ async function ensureYoutubeHookInjected(tabId, tabUrl) {
 
 async function sendToTabSafe(tabId, message, autoInject = false, tabUrl = "") {
   if (!tabId) return false;
-  if (autoInject && tabUrl) {
-    await ensureYoutubeHookInjected(tabId, tabUrl);
+  if (autoInject) {
+    if (tabUrl) {
+      await ensureYoutubeHookInjected(tabId, tabUrl);
+    }
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ["subtitle_pacer.js", "content_script.js"]
+      });
+    } catch (_) {}
   }
   try {
     await chrome.tabs.sendMessage(tabId, message);
@@ -99,7 +107,7 @@ async function sendToTabSafe(tabId, message, autoInject = false, tabUrl = "") {
     try {
       await chrome.scripting.executeScript({
         target: { tabId },
-        files: ["content_script.js"]
+        files: ["subtitle_pacer.js", "content_script.js"]
       });
       await chrome.tabs.sendMessage(tabId, message);
       return true;
@@ -448,6 +456,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
 
       if (msg.sessionId && session.sessionId && msg.sessionId !== session.sessionId) {
+        return;
+      }
+
+      if (msg.type === "ws:open") {
+        if (session.activeTabId && !msg.hasCaptionTrack && isYoutubeTabUrl(session.activeTabUrl)) {
+          await sendToTabSafe(session.activeTabId, { cmd: "caption:reprobe" });
+        }
         return;
       }
 

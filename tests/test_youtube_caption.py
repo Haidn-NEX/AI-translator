@@ -68,11 +68,15 @@ class _FakeLoop:
 class _FakeCaptionEngine:
     def __init__(self):
         self.profile = _make_dummy_profile()
+        self.stt_model_name = "dummy-whisper"
         self.translation_mode = "ollama"
         self.ollama_model = "qwen2.5:3b"
         self.source_lang = "en"
         self.custom_glossary = ""
         self.batch_calls: list[tuple[list[str], bool]] = []
+
+    def load_stt_model(self):
+        pass
 
     def reset_context(self):
         pass
@@ -374,6 +378,157 @@ Second VTT sentence here!
                 self.assertNotIn("Sentence three at fifteen seconds.", pending_after_seek)
             finally:
                 session.stop()
+
+    def test_bridge_session_audio_caption_audio_mode_switch_no_thread_crash(self):
+        """Chuyển Audio -> Caption -> Audio trên cùng BridgeSession không được lỗi 'threads can only be started once'."""
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("youtube_caption.CAPTION_CACHE_DIR", tmp),
+            patch("browser_bridge.MEETING_LOGS_DIR", tmp),
+        ):
+            fake_ws = _FakeWS()
+            fake_loop = _FakeLoop(fake_ws)
+            engine = _FakeCaptionEngine()
+            sum_cfg = SummarySettings(mode="off")
+            session = BridgeSession(
+                session_id="switch-sess-1",
+                ws=fake_ws,
+                loop=fake_loop,
+                engine=engine,
+                tab_title="Switch Mode Test",
+                tab_url="https://www.youtube.com/watch?v=switch123",
+                save_transcript=False,
+                summary_settings=sum_cfg,
+                prefer_caption=False,
+            )
+            session.summary_worker._enable_telemetry = False
+            session.start()
+            try:
+                qt_loop = QEventLoop()
+                QTimer.singleShot(120, qt_loop.quit)
+                qt_loop.exec()
+                self.assertEqual(session._input_mode, "audio")
+
+                # Chuyển sang Caption Mode
+                ok = session.activate_caption_mode(
+                    video_id="switch123",
+                    raw_text=json.dumps(
+                        {
+                            "events": [
+                                {"tStartMs": 500, "dDurationMs": 2000, "segs": [{"utf8": "Hello world."}]}
+                            ]
+                        }
+                    ),
+                    lang="en",
+                    is_asr=False,
+                    fmt="json3",
+                    playhead_ms=0,
+                )
+                self.assertTrue(ok)
+                self.assertEqual(session._input_mode, "caption")
+
+                # Quay lại Audio Mode (VD chuyển sang Shorts / video không có phụ đề)
+                session.activate_audio_mode(video_id="nocap456")
+                self.assertEqual(session._input_mode, "audio")
+                self.assertIsNotNone(session.vad_worker)
+                self.assertTrue(session.vad_worker.is_alive())
+            finally:
+                session.stop()
+
+    def test_asr_word_reconstruction_no_orphan_tail_splits_and_shouting_caps(self):
+        """ASR không được cắt đứt 1 từ cuối câu trước dấu chấm và phải chuẩn hóa ALL-CAPS la hét."""
+        asr_payload = {
+            "events": [
+                {
+                    "tStartMs": 1000,
+                    "dDurationMs": 5000,
+                    "segs": [
+                        {"utf8": ">> I"},
+                        {"utf8": " I", "tOffsetMs": 100},
+                        {"utf8": " know", "tOffsetMs": 250},
+                        {"utf8": " how", "tOffsetMs": 450},
+                        {"utf8": " long", "tOffsetMs": 650},
+                        {"utf8": " you", "tOffsetMs": 850},
+                        {"utf8": " were", "tOffsetMs": 1050},
+                        {"utf8": " there.", "tOffsetMs": 1650},
+                    ],
+                },
+                {
+                    "tStartMs": 4000,
+                    "dDurationMs": 4000,
+                    "segs": [
+                        {"utf8": "I DIDN'T"},
+                        {"utf8": " HAVE", "tOffsetMs": 300},
+                        {"utf8": " A", "tOffsetMs": 500},
+                        {"utf8": " CHOICE", "tOffsetMs": 650},
+                        {"utf8": " WITH", "tOffsetMs": 900},
+                        {"utf8": " THE", "tOffsetMs": 1100},
+                        {"utf8": " FBI.", "tOffsetMs": 1350},
+                    ],
+                },
+            ]
+        }
+        cues = parse_youtube_timedtext(json.dumps(asr_payload), fmt="json3", is_asr=True)
+        self.assertEqual(len(cues), 2)
+        self.assertEqual(cues[0].src, "I know how long you were there.")
+        self.assertEqual(cues[1].src, "I didn't have a choice with the FBI.")
+
+    def test_translate_caption_batch_rejects_lookahead_blowup_truncation_and_uppercase_echo(self):
+        """Chặn hiện tượng LLM dịch gộp câu sau, bỏ vế câu dài, hoặc giữ nguyên tiếng Anh IN HOA."""
+        with patch.object(LocalAIEngine, "check_ollama_running", return_value=True):
+            engine = LocalAIEngine(_make_dummy_profile())
+        engine.set_translation_mode("ollama")
+
+        nllb_calls: list[str] = []
+
+        def fake_nllb(text: str, src_lang: str, tgt_lang: str) -> str:
+            nllb_calls.append(text)
+            return f"[NLLB cứu] {text}"
+
+        # Batch 1: 1 từ ngắn ("Stop.") nhưng LLM bịa dài thành cả câu sau (> 5 từ)
+        def fake_ollama_blowup(system_msg, user_msg, **kwargs):
+            self.assertNotIn("Ngữ cảnh câu kế tiếp", user_msg)
+            return json.dumps({"1": "Dừng lại đi anh đang làm cái quái gì ở đây vậy hả"})
+
+        with patch.object(engine, "_call_ollama_chat", side_effect=fake_ollama_blowup), patch.object(
+            engine, "_translate_nllb", side_effect=fake_nllb
+        ):
+            vi_out, _, _ = engine.translate_caption_batch(
+                ["Stop."],
+                prev_context=[("Hey!", "Này!")],
+                next_context=["What the hell are you doing here?"],
+                source_lang="en",
+                urgent=True,
+            )
+        self.assertEqual(vi_out, ["[NLLB cứu] Stop."])
+
+        # Batch 2: câu 1 bị cắt cụt còn 1 từ, câu 2 bị rò tiếng Anh IN HOA ("STILL GOING")
+        nllb_calls.clear()
+        fake_batch_json = json.dumps(
+            {
+                "1": "Tốt.",
+                "2": "Tôi nghĩ nó STILL GOING hoạt động tốt.",
+            },
+            ensure_ascii=False,
+        )
+        with patch.object(engine, "_call_ollama_chat", return_value=fake_batch_json), patch.object(
+            engine, "_translate_nllb", side_effect=fake_nllb
+        ):
+            vi_out2, _, _ = engine.translate_caption_batch(
+                [
+                    "Wait, how do you know how long I was there?",
+                    "I think it is still going to work well.",
+                ],
+                source_lang="en",
+                urgent=False,
+            )
+        self.assertEqual(
+            vi_out2,
+            [
+                "[NLLB cứu] Wait, how do you know how long I was there?",
+                "[NLLB cứu] I think it is still going to work well.",
+            ],
+        )
 
 
 if __name__ == "__main__":

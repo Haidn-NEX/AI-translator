@@ -1,8 +1,15 @@
 (() => {
-  if (window.__LAT_CONTENT_SCRIPT_LOADED__) {
+  const CONTENT_SCRIPT_VERSION = 3;
+  if (Number(window.__LAT_CONTENT_SCRIPT_VERSION__ || 0) >= CONTENT_SCRIPT_VERSION) {
     return;
   }
+  if (typeof window.__LAT_CONTENT_SCRIPT_DISPOSE__ === "function") {
+    try {
+      window.__LAT_CONTENT_SCRIPT_DISPOSE__();
+    } catch (_) {}
+  }
   window.__LAT_CONTENT_SCRIPT_LOADED__ = true;
+  window.__LAT_CONTENT_SCRIPT_VERSION__ = CONTENT_SCRIPT_VERSION;
 
   let hostEl = null;
   let shadowRoot = null;
@@ -59,7 +66,12 @@
   const YT_HOOK_IN_EVENT = "__lat_yt_caption_in";
   let pendingAcquireReqId = null;
   let pendingAcquireTimer = null;
+  let pendingAcquireIsBgRetry = false;
+  let pendingRetryTimer = null;
   let lastProbedVideoKey = "";
+  let retriedVideoKeys = new Set();
+  let lastSentTrackKey = "";
+  let lastSentTrackTs = 0;
 
   const captionState = {
     active: false,
@@ -110,7 +122,7 @@
   async function saveDragOffset() {
     try {
       await chrome.storage.local.set({ [dragStorageKey]: dragOffset });
-    } catch (_) {}
+    } catch (_) { }
   }
 
   function initPacerInstance() {
@@ -395,7 +407,7 @@
       if (sm) return sm[1];
       const lm = u.pathname.match(/^\/live\/([a-zA-Z0-9_-]{6,})/);
       if (lm) return lm[1];
-    } catch (_) {}
+    } catch (_) { }
     return "";
   }
 
@@ -404,7 +416,12 @@
     if (!v) {
       return { playheadMs: 0, playbackRate: 1.0, paused: false };
     }
-    const playheadMs = Math.max(0, Math.round((Number(v.currentTime) || 0) * 1000));
+    let curSec = Number(v.currentTime) || 0;
+    const durSec = Number(v.duration);
+    if (Number.isFinite(durSec) && durSec > 0 && curSec > durSec + 1.5) {
+      curSec = 0;
+    }
+    const playheadMs = Math.max(0, Math.round(curSec * 1000));
     const playbackRate = Math.max(0.25, Math.min(3.0, Number(v.playbackRate) || 1.0));
     return {
       playheadMs,
@@ -563,7 +580,7 @@
         paused: snap.paused,
         isSeek: Boolean(isSeek)
       })
-      .catch(() => {});
+      .catch(() => { });
   }
 
   function startCaptionSync(initPayload) {
@@ -615,20 +632,38 @@
 
   function clearPendingAcquire() {
     pendingAcquireReqId = null;
+    pendingAcquireIsBgRetry = false;
     if (pendingAcquireTimer) {
       clearTimeout(pendingAcquireTimer);
       pendingAcquireTimer = null;
     }
   }
 
+  function clearPendingRetry() {
+    if (pendingRetryTimer) {
+      clearTimeout(pendingRetryTimer);
+      pendingRetryTimer = null;
+    }
+  }
+
   function sendCapturedTrackToBackend(track) {
     if (!isOverlayActive || !track || !track.raw) return;
+    const vid = track.videoId || getCurrentYoutubeVideoId() || "yt";
+    const trackKey = `${vid}:${track.lang || ""}:${Boolean(track.isAsr)}:${track.raw.length}`;
+    const now = Date.now();
+    if (trackKey === lastSentTrackKey && now - lastSentTrackTs < 5000) {
+      return;
+    }
+    lastSentTrackKey = trackKey;
+    lastSentTrackTs = now;
+    clearPendingRetry();
+
     const snap = getVideoPlaybackSnapshot();
     chrome.runtime
       .sendMessage({
         from: "content_script",
         cmd: "caption:load",
-        videoId: track.videoId || getCurrentYoutubeVideoId() || "yt",
+        videoId: vid,
         lang: track.lang || currentSettings.sourceLang || "en",
         kind: track.kind || "",
         isAsr: Boolean(track.isAsr),
@@ -640,24 +675,27 @@
         tabTitle: document.title || "YouTube",
         tabUrl: location.href
       })
-      .catch(() => {});
+      .catch(() => { });
   }
 
-  function sendCaptionUnavailableToBackend(videoId = "") {
+  function sendCaptionUnavailableToBackend(videoId = "", reason = "unavailable") {
     if (!isOverlayActive) return;
+    lastSentTrackKey = "";
+    lastSentTrackTs = 0;
     stopCaptionSync();
     chrome.runtime
       .sendMessage({
         from: "content_script",
         cmd: "caption:unavailable",
         videoId: videoId || getCurrentYoutubeVideoId() || "",
+        reason: String(reason || "unavailable"),
         tabTitle: document.title || "YouTube",
         tabUrl: location.href
       })
-      .catch(() => {});
+      .catch(() => { });
   }
 
-  function requestYoutubeCaptions(force = false) {
+  function requestYoutubeCaptions(force = false, isBgRetry = false) {
     if (!isOverlayActive || !isYoutubeVideoPage()) return;
     const vid = getCurrentYoutubeVideoId();
     const probeKey = `${vid}:${currentSettings.sourceLang || "en"}`;
@@ -666,14 +704,31 @@
     }
     lastProbedVideoKey = probeKey;
     clearPendingAcquire();
+    if (!isBgRetry) {
+      clearPendingRetry();
+    }
 
     const reqId = `acq-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     pendingAcquireReqId = reqId;
+    pendingAcquireIsBgRetry = Boolean(isBgRetry);
     pendingAcquireTimer = setTimeout(() => {
       if (pendingAcquireReqId !== reqId) return;
-      pendingAcquireReqId = null;
-      sendCaptionUnavailableToBackend(vid);
-    }, 2400);
+      const wasBgRetry = pendingAcquireIsBgRetry;
+      clearPendingAcquire();
+      const retryKey = `${vid}:${currentSettings.sourceLang || "en"}`;
+      if (!wasBgRetry && vid && !retriedVideoKeys.has(retryKey)) {
+        retriedVideoKeys.add(retryKey);
+        clearPendingRetry();
+        pendingRetryTimer = setTimeout(() => {
+          pendingRetryTimer = null;
+          if (!isOverlayActive || captionState.active) return;
+          if (getCurrentYoutubeVideoId() !== vid) return;
+          requestYoutubeCaptions(true, true);
+        }, 900);
+        return;
+      }
+      sendCaptionUnavailableToBackend(vid, "acquire_timeout");
+    }, 5500);
 
     try {
       document.dispatchEvent(
@@ -688,11 +743,11 @@
       );
     } catch (_) {
       clearPendingAcquire();
-      sendCaptionUnavailableToBackend(vid);
+      sendCaptionUnavailableToBackend(vid, "dispatch_error");
     }
   }
 
-  document.addEventListener(YT_HOOK_OUT_EVENT, (evt) => {
+  const onHookOutEvent = (evt) => {
     if (!evt || !evt.detail) return;
     let msg;
     try {
@@ -703,13 +758,35 @@
     if (!msg || !msg.event || !isOverlayActive) return;
 
     if (msg.event === "acquire_result") {
+      let wasBgRetry = false;
       if (pendingAcquireReqId && msg.reqId === pendingAcquireReqId) {
+        wasBgRetry = pendingAcquireIsBgRetry;
         clearPendingAcquire();
       }
       if (msg.status === "ready" && msg.track && msg.track.raw) {
         sendCapturedTrackToBackend(msg.track);
       } else {
-        sendCaptionUnavailableToBackend(msg.videoId || "");
+        const vid = msg.videoId || getCurrentYoutubeVideoId() || "";
+        const transientReasons = new Set(["flash_timeout", "no_player", "player_api_error", "no_captions"]);
+        const retryKey = `${vid}:${currentSettings.sourceLang || "en"}`;
+        if (
+          !wasBgRetry &&
+          vid &&
+          transientReasons.has(msg.reason) &&
+          !retriedVideoKeys.has(retryKey)
+        ) {
+          // Thử lại thêm 1 nhịp sau 1200ms trước khi báo unavailable để tránh chuyển nhầm sang Audio Mode sớm
+          retriedVideoKeys.add(retryKey);
+          clearPendingRetry();
+          pendingRetryTimer = setTimeout(() => {
+            pendingRetryTimer = null;
+            if (!isOverlayActive || captionState.active) return;
+            if (getCurrentYoutubeVideoId() !== vid) return;
+            requestYoutubeCaptions(true, true);
+          }, 1200);
+          return;
+        }
+        sendCaptionUnavailableToBackend(vid, msg.reason || "unavailable");
       }
       return;
     }
@@ -727,9 +804,31 @@
         sendCapturedTrackToBackend(msg.track);
       }
     }
-  });
+  };
+  document.addEventListener(YT_HOOK_OUT_EVENT, onHookOutEvent);
+
+  function isIgnoredPreviewVideo(v) {
+    if (!v || typeof v.closest !== "function") return false;
+    return Boolean(
+      v.closest(
+        "ytd-video-preview, ytd-inline-preview-player, ytd-moving-thumbnail-renderer, #inline-preview-player"
+      )
+    );
+  }
 
   function findBestVideoElement() {
+    if (isYoutubeVideoPage()) {
+      const mainYtVideo = document.querySelector(
+        "#movie_player video.html5-main-video, #shorts-player video.html5-main-video, #movie_player video"
+      );
+      if (mainYtVideo) {
+        const r = mainYtVideo.getBoundingClientRect();
+        if (r.width >= 120 && r.height >= 80) {
+          return mainYtVideo;
+        }
+      }
+    }
+
     const videos = Array.from(document.querySelectorAll("video"));
     if (videos.length === 0) return null;
 
@@ -737,6 +836,7 @@
     let bestScore = 0;
 
     for (const v of videos) {
+      if (isIgnoredPreviewVideo(v)) continue;
       const rect = v.getBoundingClientRect();
       if (rect.width < 120 || rect.height < 80) continue;
       const area = rect.width * rect.height;
@@ -842,8 +942,23 @@
 
   function onYtNavigateFinish() {
     if (!isOverlayActive) return;
+    const currentVid = getCurrentYoutubeVideoId();
+    if (captionState.active && captionState.videoId && captionState.videoId === currentVid) {
+      targetVideo = findBestVideoElement();
+      if (resizeObserver) {
+        resizeObserver.disconnect();
+        if (targetVideo) resizeObserver.observe(targetVideo);
+      }
+      schedulePositionUpdate();
+      renderCaptionFrame();
+      sendPlayheadToBackend(true);
+      return;
+    }
     stopCaptionSync();
+    clearPendingRetry();
     lastProbedVideoKey = "";
+    lastSentTrackKey = "";
+    lastSentTrackTs = 0;
     if (pacer) {
       pacer.reset_subtitles();
     }
@@ -872,6 +987,7 @@
   function onMediaSeekOrRateChangeCapture(evt) {
     if (!captionState.active) return;
     if (evt && evt.target && evt.target.tagName === "VIDEO") {
+      if (isIgnoredPreviewVideo(evt.target)) return;
       if (!targetVideo || evt.target === targetVideo) {
         targetVideo = evt.target;
         const { playheadMs } = getVideoPlaybackSnapshot();
@@ -886,14 +1002,15 @@
   }
 
   function onMediaPlayCapture(evt) {
-    if (pauseDimTimer) {
-      clearTimeout(pauseDimTimer);
-      pauseDimTimer = null;
-    }
-    if (containerEl) {
-      containerEl.classList.remove("lat-paused-dim");
-    }
     if (evt && evt.target && evt.target.tagName === "VIDEO") {
+      if (isIgnoredPreviewVideo(evt.target)) return;
+      if (pauseDimTimer) {
+        clearTimeout(pauseDimTimer);
+        pauseDimTimer = null;
+      }
+      if (containerEl) {
+        containerEl.classList.remove("lat-paused-dim");
+      }
       targetVideo = evt.target;
       if (resizeObserver) {
         resizeObserver.disconnect();
@@ -999,6 +1116,8 @@
     }
 
     if (evt.type === "caption_fallback") {
+      lastSentTrackKey = "";
+      lastSentTrackTs = 0;
       stopCaptionSync();
       return;
     }
@@ -1138,7 +1257,11 @@
     isOverlayActive = false;
     isUserHidden = false;
     lastProbedVideoKey = "";
+    lastSentTrackKey = "";
+    lastSentTrackTs = 0;
+    retriedVideoKeys.clear();
     clearPendingAcquire();
+    clearPendingRetry();
     stopCaptionSync();
     if (pacer) {
       pacer.reset_subtitles();
@@ -1166,15 +1289,16 @@
     summaryFooterEl = null;
   }
 
-  chrome.storage.onChanged.addListener((changes, areaName) => {
+  const onStorageChanged = (changes, areaName) => {
     if (areaName === "local" && changes[dragStorageKey]) {
       const nv = changes[dragStorageKey].newValue;
       dragOffset = nv ? { dx: Number(nv.dx) || 0, dy: Number(nv.dy) || 0 } : { dx: 0, dy: 0 };
       schedulePositionUpdate();
     }
-  });
+  };
+  chrome.storage.onChanged.addListener(onStorageChanged);
 
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  const onRuntimeMessage = (msg, _sender, sendResponse) => {
     if (!msg || !msg.cmd) return false;
 
     if (msg.cmd === "overlay:show") {
@@ -1196,6 +1320,14 @@
         sendResponse({ ok: true });
       });
       return true;
+    }
+
+    if (msg.cmd === "caption:reprobe") {
+      if (isOverlayActive && isYoutubeVideoPage() && !captionState.active) {
+        requestYoutubeCaptions(true);
+      }
+      sendResponse({ ok: true });
+      return false;
     }
 
     if (msg.cmd === "overlay:hide") {
@@ -1236,5 +1368,15 @@
     }
 
     return false;
-  });
+  };
+  chrome.runtime.onMessage.addListener(onRuntimeMessage);
+
+  window.__LAT_CONTENT_SCRIPT_DISPOSE__ = () => {
+    try {
+      window.removeEventListener(YT_HOOK_OUT_EVENT, onHookOutEvent);
+      chrome.storage.onChanged.removeListener(onStorageChanged);
+      chrome.runtime.onMessage.removeListener(onRuntimeMessage);
+      destroyOverlay();
+    } catch (_) {}
+  };
 })();

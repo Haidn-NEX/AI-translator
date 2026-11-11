@@ -622,18 +622,39 @@ class LocalAIEngine:
             # Câu dài từ 4 từ trở lên, hoàn toàn không có dấu tiếng Việt và có từ chức năng tiếng Anh
             if total_words >= 4 and not _VI_DIACRITIC_RE.search(vi_text) and en_hits >= 1:
                 return True
-            # Tỷ lệ từ chức năng tiếng Anh chiếm >= 25% tổng số từ
+            # Tỷ lệ từ chức năng tiếng Anh chiếm >= 25% tổng số từ hoặc có từ >= 2 stopwords tiếng Anh rõ rệt
             if en_hits >= 3 and (en_hits / total_words) >= 0.25:
+                return True
+            if en_hits >= 2 and (en_hits / total_words) >= 0.16:
                 return True
 
             # Quy luật âm vị Quốc ngữ: Không tồn tại âm tiết tiếng Việt không dấu nào dài >= 7 chữ cái thuần ASCII
             # hoặc kết thúc bằng hậu tố hình thái tiếng Anh (-ing, -tion, -ment, -ness, -less, -able, -ible).
-            # Nếu từ viết thường (không phải Tên riêng viết hoa) và không thuộc từ mượn IT -> chắc chắn bị rò tiếng Anh!
+            # Đồng thời bắt cả trường hợp LLM rò từ tiếng Anh IN HOA (VD: 'GOING', 'STILL', 'THAT', 'DELAYING').
             src_low = (source_text or "").lower()
+            unambiguous_en = {
+                "the", "that", "this", "with", "from", "have", "what", "when", "where",
+                "which", "their", "they", "were", "been", "would", "could", "should",
+                "about", "there", "these", "those", "still", "going", "into", "because",
+                "while", "after", "before", "through", "between", "without", "nothing",
+                "something", "everything", "anything", "someone", "everyone", "anyone",
+            }
             for raw_w, low_w in zip(ascii_words, ascii_low):
-                if not raw_w.islower() or low_w in allowed or "'" in low_w:
+                if low_w in allowed:
                     continue
-                if len(low_w) >= 7:
+                if "'" in low_w and low_w in {
+                    "it's", "that's", "there's", "what's", "he's", "she's", "we're", "you're",
+                    "they're", "i'm", "don't", "doesn't", "didn't", "can't", "couldn't", "won't",
+                    "wouldn't", "shouldn't", "isn't", "aren't", "wasn't", "weren't",
+                }:
+                    return True
+                if low_w in unambiguous_en and low_w in src_low:
+                    return True
+                if not raw_w.islower() and not (raw_w.isupper() and len(low_w) >= 4):
+                    continue
+                if "'" in low_w:
+                    continue
+                if len(low_w) >= 7 and (raw_w.islower() or low_w in src_low):
                     return True
                 if len(low_w) >= 5 and (
                     low_w.endswith(("ing", "tion", "ment", "ness", "less", "able", "ible"))
@@ -925,6 +946,65 @@ class LocalAIEngine:
                     out[idx] = m.group(2).strip()
         return out
 
+    @staticmethod
+    def _word_jaccard(text_a: str, text_b: str) -> float:
+        words_a = set(re.findall(r"\w+", (text_a or "").lower()))
+        words_b = set(re.findall(r"\w+", (text_b or "").lower()))
+        if not words_a or not words_b:
+            return 0.0
+        return len(words_a & words_b) / float(len(words_a | words_b))
+
+    @classmethod
+    def _is_misaligned_caption_line(cls, source_text: str, vi_text: str) -> bool:
+        """
+        Phát hiện lỗi LLM (đặc biệt model 3B) dịch lệch dòng kế tiếp sang dòng hiện tại,
+        gộp 2 dòng làm câu phình bất thường, hoặc bỏ sót mệnh đề chỉ còn 1-2 từ cụt lủn.
+        """
+        src = (source_text or "").strip()
+        vi = (vi_text or "").strip()
+        if not src or not vi:
+            return True
+        if _CJK_RE.search(src):
+            return False
+
+        src_words = re.findall(r"[a-zA-Z0-9']+", src)
+        vi_words = re.findall(r"\w+", vi)
+        n_src = len(src_words)
+        n_vi = len(vi_words)
+        if n_src == 0:
+            return False
+
+        # 1. Phình độ dài bất thường do LLM dịch nhầm câu dài kế tiếp vào câu ngắn hiện tại
+        # (VD: "Yeah." -> 28 từ, "kid." -> 7 từ, "stay alive" -> 19 từ, "Signs." -> 7 từ)
+        if n_src == 1 and n_vi > 5:
+            return True
+        if n_src == 2 and n_vi > 8:
+            return True
+        if n_src == 3 and n_vi > 12:
+            return True
+        if n_vi > max(6, int(n_src * 2.8) + 3):
+            return True
+
+        # 2. Cụt độ dài bất thường do LLM đẩy phần sau sang câu kế tiếp hoặc bỏ sót mệnh đề
+        # (VD: "Donnie. Thanks a lot." -> "Donnie.", "Okay. A couple hours." -> "Okay.",
+        #  "just so she could tell me that she was next if" -> "đồng chí")
+        if n_src >= 4 and n_vi <= 1:
+            return True
+        if n_src >= 6 and n_vi <= 2:
+            return True
+        if n_src >= 10 and n_vi < max(4, int(n_src * 0.42)):
+            return True
+
+        # 3. Câu gốc có từ 2 mệnh đề độc lập trở lên nhưng bản dịch bị cắt cụt chỉ còn <= 3 từ
+        clauses = [
+            c for c in re.split(r"[\.\!\?]+", src)
+            if len(re.findall(r"[a-zA-Z0-9']+", c)) >= 2
+        ]
+        if len(clauses) >= 2 and n_src >= 5 and n_vi <= 3:
+            return True
+
+        return False
+
     def translate_caption_batch(
         self,
         items: list[str],
@@ -934,11 +1014,12 @@ class LocalAIEngine:
         urgent: bool = False,
     ) -> tuple[list[str], float, str]:
         """
-        Dịch chuẩn ngữ cảnh trước/sau (bidirectional context) cho 1..N câu phụ đề YouTube.
+        Dịch chuẩn ngữ cảnh cho 1..N câu phụ đề YouTube.
         - Giữ cố định OLLAMA_NUM_CTX = 1024 (không bao giờ gây reload VRAM).
+        - KHÔNG đưa next_context (lookahead) vào prompt của LLM 3B để triệt tiêu 100% lỗi dịch nhầm câu sau vào câu hiện tại.
         - urgent=True (câu ngay tại playhead): có quyền preempt SummaryWorker để hiện tức thì (< 1s).
         - urgent=False (dịch đón đầu +90s): xếp hàng lịch sự trên _llm_lock, không cắt ngang SummaryWorker.
-        - Đảm bảo 100% đầu ra khớp số phần tử 1-1 với items và lọc sạch CJK / rò tiếng Anh từng dòng.
+        - Đảm bảo 100% đầu ra khớp số phần tử 1-1 với items, kiểm tra tỷ lệ độ dài/lệch dòng và lọc sạch CJK / rò tiếng Anh từng dòng.
         """
         if not items:
             return [], 0.0, ("Ollama" if self.translation_mode == "ollama" else "NLLB")
@@ -947,7 +1028,6 @@ class LocalAIEngine:
         eff_lang = self._normalize_lang_code(source_lang or self.source_lang)
         src_flores = self._resolve_flores_lang(eff_lang)
         prev_pairs = list(prev_context or [])[-2:]
-        lookahead = [s.strip() for s in (next_context or []) if s and s.strip()][:2]
 
         if not self._can_use_ollama_now():
             vi_out = [
@@ -964,7 +1044,7 @@ class LocalAIEngine:
             system_msg = (
                 "You are a professional video subtitle translator into concise, natural Vietnamese (100% Quốc ngữ). "
                 "RULES:\n"
-                "1. Translate ONLY the text inside <source>...</source>. Use previous/upcoming context ONLY to understand pronouns and incomplete clauses — NEVER translate context lines.\n"
+                "1. Translate ONLY the exact text inside <source>...</source>. Use previous context ONLY to resolve pronouns — NEVER translate or repeat context lines.\n"
                 "2. Omit spoken fillers ('you know', 'like', 'um', 'uh', 'I mean').\n"
                 "3. NEVER output Chinese/Cyrillic characters. Translate ALL common English words into natural Vietnamese; keep ONLY brand/person/tech proper nouns.\n"
                 "4. Output ONLY the final Vietnamese subtitle line, no tags."
@@ -972,13 +1052,11 @@ class LocalAIEngine:
             user_parts = []
             if self.custom_glossary:
                 user_parts.append(f"Glossary / Proper nouns to follow: {self.custom_glossary}")
-            if prev_pairs:
+            src_word_count = len(re.findall(r"[a-zA-Z0-9']+", src_one))
+            if prev_pairs and src_word_count >= 3:
                 ctx_lines = [f"- {s} => {v}" for s, v in prev_pairs]
                 user_parts.append("Previous lines (reference only, do NOT translate):\n" + "\n".join(ctx_lines))
             user_parts.append(f"<source>{src_one}</source>")
-            if lookahead:
-                nxt_lines = [f"- {s}" for s in lookahead]
-                user_parts.append("Upcoming lines (lookahead only, do NOT translate):\n" + "\n".join(nxt_lines))
             user_msg = "\n\n".join(user_parts)
 
             res = self._call_ollama_chat(
@@ -1003,6 +1081,7 @@ class LocalAIEngine:
                 not cleaned
                 or self._contains_cjk(cleaned)
                 or self._is_untranslated_echo(src_one, cleaned, echo_check_lang, self._glossary_ascii_terms)
+                or self._is_misaligned_caption_line(src_one, cleaned)
             ):
                 vi_fallback = self._translate_nllb(src_one, src_lang=src_flores, tgt_lang="vie_Latn")
                 return [vi_fallback], (time.perf_counter() - t0) * 1000.0, "NLLB"
@@ -1014,7 +1093,7 @@ class LocalAIEngine:
             "You are a professional video subtitle translator into concise, natural Vietnamese (100% Quốc ngữ). "
             "RULES:\n"
             f"1. Translate EACH numbered subtitle in <batch>...</batch> into natural Vietnamese and return a JSON object with EXACT keys {expected_keys}.\n"
-            "2. NEVER merge two numbered items into one and NEVER omit any key. Each key must translate ONLY its corresponding numbered line, using surrounding lines and context only to resolve pronouns, grammar, and meaning.\n"
+            "2. STRICT 1-TO-1 ALIGNMENT: Key \"1\" MUST translate ONLY line [1], key \"2\" MUST translate ONLY line [2], etc. NEVER shift text between keys, NEVER merge two lines into one key, and NEVER drop the second sentence of a line.\n"
             "3. Omit spoken fillers ('you know', 'like', 'um', 'uh', 'I mean'). NEVER output Chinese/Cyrillic characters. Translate ALL common English words into natural Vietnamese; keep ONLY brand/person/tech proper nouns.\n"
             '4. Return ONLY valid JSON, e.g. {"1": "...", "2": "..."}.'
         )
@@ -1022,13 +1101,10 @@ class LocalAIEngine:
         if self.custom_glossary:
             user_parts.append(f"Glossary / Proper nouns to follow: {self.custom_glossary}")
         if prev_pairs:
-            ctx_lines = [f"- {s} => {v}" for s, v in prev_pairs]
-            user_parts.append("Previous context (do NOT include in JSON):\n" + "\n".join(ctx_lines))
+            ctx_lines = [f"- {s} => {v}" for s, v in prev_pairs[-1:]]
+            user_parts.append("Previous context (reference only, do NOT include in JSON):\n" + "\n".join(ctx_lines))
         batch_lines = [f"[{idx}] {line.strip()}" for idx, line in enumerate(items, start=1)]
         user_parts.append("<batch>\n" + "\n".join(batch_lines) + "\n</batch>")
-        if lookahead:
-            nxt_lines = [f"- {s}" for s in lookahead]
-            user_parts.append("Upcoming lookahead (do NOT include in JSON):\n" + "\n".join(nxt_lines))
         user_msg = "\n\n".join(user_parts)
 
         res = self._call_ollama_chat(
@@ -1065,13 +1141,24 @@ class LocalAIEngine:
             if cleaned:
                 cleaned = self._strip_echo_against_pairs(cleaned, src_stripped, rolling_pairs)
 
-            duplicate_of_prev = (
-                bool(cleaned)
-                and bool(final_out)
-                and len(cleaned.split()) >= 3
-                and cleaned.lower() == final_out[-1].lower()
-                and src_stripped.lower() != (items[idx - 2] or "").strip().lower()
-            )
+            duplicate_of_prev = False
+            if cleaned and final_out:
+                for prev_idx, prev_vi in enumerate(final_out):
+                    if not prev_vi:
+                        continue
+                    prev_src = (items[prev_idx] or "").strip()
+                    if self._word_jaccard(src_stripped, prev_src) >= 0.55:
+                        continue
+                    if (
+                        len(cleaned.split()) >= 3
+                        and cleaned.lower() == prev_vi.lower()
+                    ) or (
+                        len(cleaned.split()) >= 4
+                        and self._word_jaccard(cleaned, prev_vi) >= 0.68
+                    ):
+                        duplicate_of_prev = True
+                        break
+
             invalid = (
                 not cleaned
                 or duplicate_of_prev
@@ -1079,6 +1166,7 @@ class LocalAIEngine:
                 or self._is_untranslated_echo(
                     src_stripped, cleaned, echo_check_lang, self._glossary_ascii_terms
                 )
+                or self._is_misaligned_caption_line(src_stripped, cleaned)
             )
             if invalid:
                 rescued = self._translate_nllb(src_stripped, src_lang=src_flores, tgt_lang="vie_Latn")

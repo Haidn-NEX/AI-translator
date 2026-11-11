@@ -195,11 +195,19 @@ async function connectWebSocket(state) {
         JSON.stringify({
           type: "caption_unavailable",
           video_id: state.captionUnavailableNotice.videoId || "",
+          reason: state.captionUnavailableNotice.reason || "unavailable",
           tab_title: state.captionUnavailableNotice.tabTitle || state.tabTitle || "",
           tab_url: state.captionUnavailableNotice.tabUrl || state.tabUrl || ""
         })
       );
     }
+
+    notifyServiceWorker({
+      type: "ws:open",
+      tabId: state.tabId,
+      sessionId: state.sessionId,
+      hasCaptionTrack: Boolean(state.activeCaptionTrack && state.activeCaptionTrack.raw)
+    });
 
     state.pingTimer = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
@@ -491,8 +499,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       activeState.pcmPaused = false;
       if (msg.tabTitle) activeState.tabTitle = msg.tabTitle;
       if (msg.tabUrl) activeState.tabUrl = msg.tabUrl;
+      const reason = msg.reason || "unavailable";
       activeState.captionUnavailableNotice = {
         videoId: msg.videoId || "",
+        reason,
         tabTitle: activeState.tabTitle || "",
         tabUrl: activeState.tabUrl || ""
       };
@@ -501,6 +511,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           JSON.stringify({
             type: "caption_unavailable",
             video_id: msg.videoId || "",
+            reason,
             tab_title: activeState.tabTitle || "",
             tab_url: activeState.tabUrl || ""
           })

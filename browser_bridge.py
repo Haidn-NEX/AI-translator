@@ -435,8 +435,20 @@ class BridgeSession:
                 pass
 
     def _start_audio_workers_unlocked(self) -> None:
-        # Tạo mới instance nếu worker cũ đã từng chạy và dừng (threading.Thread không thể start() 2 lần)
-        if self.vad_worker is None or (not self.vad_worker.is_alive() and getattr(self.vad_worker, "_started", None) and self.vad_worker._started.is_set()):
+        # Tạo mới instance nếu worker cũ đã từng được start() (threading.Thread chỉ start được 1 lần)
+        vad_used = bool(
+            self.vad_worker is not None
+            and (
+                self.vad_worker.is_alive()
+                or (getattr(self.vad_worker, "_started", None) and self.vad_worker._started.is_set())
+            )
+        )
+        infer_used = bool(
+            self.infer_worker is not None
+            and (self.infer_worker.isRunning() or self.infer_worker.isFinished())
+        )
+        if self.vad_worker is None or self.infer_worker is None or vad_used or infer_used:
+            self._stop_audio_workers_unlocked()
             self.queue = queue.Queue()
             self.vad_worker = TabAudioVADWorker(
                 self.queue,
@@ -473,6 +485,12 @@ class BridgeSession:
         if self.vad_worker is not None:
             try:
                 self.vad_worker.stop()
+                try:
+                    self.vad_worker.pcm_queue.put_nowait(b"")
+                except queue.Full:
+                    pass
+                if self.vad_worker.is_alive():
+                    self.vad_worker.join(timeout=1.5)
             except Exception:
                 pass
         if self.infer_worker is not None:
@@ -550,6 +568,45 @@ class BridgeSession:
         with self._mode_switch_lock:
             if self._stopped:
                 return False
+            norm_lang = normalize_yt_lang(lang)
+            start_ms = max(0, int(playhead_ms or 0))
+            if cues and start_ms > cues[-1].end_ms + 15_000:
+                start_ms = 0
+
+            # Nếu cùng đúng videoId, ngôn ngữ, loại track và số câu đang chạy -> không hủy worker đang dịch dở
+            if (
+                self._input_mode == "caption"
+                and self._caption_video_id == str(video_id or "yt")
+                and self.caption_worker is not None
+                and self.caption_worker.isRunning()
+                and self.caption_worker.track_lang == norm_lang
+                and self.caption_worker.is_asr == bool(is_asr)
+                and len(self.caption_worker.cues) == len(cues)
+            ):
+                if tab_title and tab_title.strip():
+                    self.tab_title = tab_title.strip()
+                    self.transcript_logger.title = self.tab_title
+                if tab_url and tab_url.strip():
+                    self.tab_url = tab_url.strip()
+                    self.transcript_logger.url = self.tab_url
+                self.caption_worker.update_playhead(
+                    start_ms, playback_rate=float(playback_rate or 1.0), paused=False
+                )
+                self._record_watched_cues_up_to(start_ms, is_seek=True)
+                snap_cues = self.caption_worker.get_cues_snapshot()
+                self._schedule_send(
+                    {
+                        "type": "caption_track_ready",
+                        "video_id": str(video_id or "yt"),
+                        "lang": norm_lang,
+                        "is_asr": bool(is_asr),
+                        "total_cues": len(snap_cues),
+                        "cached_cues": sum(1 for c in snap_cues if c.get("vi")),
+                        "cues": snap_cues,
+                    }
+                )
+                return True
+
             video_changed = bool(video_id and self._caption_video_id and video_id != self._caption_video_id)
             self._stop_audio_workers_unlocked()
             self._stop_caption_worker_unlocked()
@@ -564,8 +621,6 @@ class BridgeSession:
                 self.summary_worker.reset()
                 self.engine.reset_context()
 
-            norm_lang = normalize_yt_lang(lang)
-            start_ms = max(0, int(playhead_ms or 0))
             with self._caption_watch_lock:
                 self._caption_video_id = str(video_id or "yt")
                 self._caption_lang = norm_lang
@@ -580,7 +635,7 @@ class BridgeSession:
                 track_lang=norm_lang,
                 is_asr=bool(is_asr),
                 engine=self.engine,
-                initial_playhead_ms=max(0, int(playhead_ms or 0)),
+                initial_playhead_ms=start_ms,
                 playback_rate=float(playback_rate or 1.0),
             )
             cw.track_initialized.connect(
@@ -594,13 +649,13 @@ class BridgeSession:
             self._input_mode = "caption"
             logger.info(
                 f"[Bridge] Chuyển sang Caption Mode cho video '{video_id}' "
-                f"(lang={norm_lang}, is_asr={is_asr}, cues={len(cues)}, playhead={playhead_ms}ms)"
+                f"(lang={norm_lang}, is_asr={is_asr}, cues={len(cues)}, playhead={start_ms}ms)"
             )
             cw.start()
             return True
 
     def activate_audio_mode(
-        self, video_id: str = "", tab_title: str = "", tab_url: str = ""
+        self, video_id: str = "", tab_title: str = "", tab_url: str = "", reason: str = ""
     ) -> None:
         if self._stopped:
             return
@@ -625,7 +680,10 @@ class BridgeSession:
 
             if self._input_mode == "audio" and self.infer_worker is not None and self.infer_worker.isRunning():
                 return
-            logger.info(f"[Bridge] Kích hoạt Audio Mode (tabCapture -> Whisper) cho phiên '{self.session_id}'.")
+            reason_info = f" (video={video_id or 'n/a'}, reason={reason})" if (video_id or reason) else ""
+            logger.info(
+                f"[Bridge] Kích hoạt Audio Mode (tabCapture -> Whisper) cho phiên '{self.session_id}'{reason_info}."
+            )
             self._start_audio_workers_unlocked()
 
     def start(self) -> None:
@@ -642,7 +700,7 @@ class BridgeSession:
         if self._prefer_caption:
             self._on_status_from_worker("⏳ Đang kiểm tra phụ đề gốc trên YouTube...")
             try:
-                self._caption_grace_timer = self.loop.call_later(2.4, self._on_caption_grace_timeout)
+                self._caption_grace_timer = self.loop.call_later(6.0, self._on_caption_grace_timeout)
             except Exception:
                 with self._mode_switch_lock:
                     self._start_audio_workers_unlocked()
@@ -1030,12 +1088,14 @@ class BrowserBridgeServer:
                         vid = str(data.get("video_id") or "")
                         new_title = str(data.get("tab_title") or "")
                         new_url = str(data.get("tab_url") or "")
+                        reason = str(data.get("reason") or "unavailable")
                         await asyncio.get_running_loop().run_in_executor(
                             None,
                             lambda: owned_session.activate_audio_mode(
                                 video_id=vid,
                                 tab_title=new_title,
                                 tab_url=new_url,
+                                reason=reason,
                             ),
                         )
                         if new_title and self.on_session_started:

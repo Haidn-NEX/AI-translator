@@ -16,7 +16,7 @@ from incoming_pipeline import APP_DIR, _PURE_FILLERS
 logger = logging.getLogger("LiveTranslator")
 
 CAPTION_CACHE_DIR = os.path.join(APP_DIR, "caption_cache")
-CAPTION_CACHE_SCHEMA_VER = 1
+CAPTION_CACHE_SCHEMA_VER = 2
 CAPTION_CACHE_MAX_FILES = 80
 
 # Nhãn âm thanh nền nhúng bên trong câu phụ đề (VD: "[Music] Hello everyone" -> "Hello everyone")
@@ -27,6 +27,7 @@ _INLINE_NOISE_TAG_RE = re.compile(
 )
 _INLINE_NOTES_RE = re.compile(r"[♪♫♬♩]+")
 _SPEAKER_ARROW_RE = re.compile(r"^\s*(?:>>+|-\s*(?=[A-Z]))\s*")
+_INLINE_ARROW_RE = re.compile(r">>+\s*")
 _VTT_TAG_RE = re.compile(r"<[^>]+>")
 _CJK_CHAR_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
 
@@ -41,12 +42,78 @@ _CLAUSE_CONJUNCTIONS = {
 
 _DANGLING_TAIL_WORDS = {
     "the", "a", "an", "to", "of", "in", "on", "at", "for", "with", "by", "from",
-    "into", "about", "as", "and", "but", "or", "so", "because", "if", "when",
-    "while", "that", "which", "who", "whose", "is", "are", "was", "were", "be",
-    "been", "have", "has", "had", "do", "does", "did", "will", "would", "can",
-    "could", "should", "must", "my", "your", "his", "her", "our", "their", "its",
-    "this", "these", "those", "very", "too", "just", "not",
+    "into", "onto", "upon", "about", "as", "and", "but", "or", "nor", "so", "yet",
+    "because", "if", "when", "while", "until", "unless", "since", "although", "though",
+    "that", "which", "who", "whom", "whose", "where", "what", "how", "whether",
+    "is", "are", "was", "were", "be", "been", "being", "am",
+    "have", "has", "had", "having", "do", "does", "did",
+    "will", "would", "can", "could", "should", "shall", "must", "may", "might",
+    "my", "your", "his", "her", "our", "their", "its",
+    "this", "these", "those", "some", "any", "no", "every", "each",
+    "very", "too", "just", "not", "only", "also", "even", "still", "already",
+    "i", "you", "he", "she", "we", "they", "it",
+    "i'm", "you're", "he's", "she's", "we're", "they're", "it's",
+    "i've", "you've", "we've", "they've", "i'd", "you'd", "he'd", "she'd", "we'd", "they'd",
+    "i'll", "you'll", "he'll", "she'll", "we'll", "they'll",
+    "don't", "doesn't", "didn't", "can't", "couldn't", "won't", "wouldn't", "shouldn't",
+    "isn't", "aren't", "wasn't", "weren't", "haven't", "hasn't", "hadn't",
+    "let", "let's", "make", "get", "got", "getting", "take", "took", "give", "gave",
+    "keep", "kept", "put", "going", "want", "wanted", "need", "needed", "try", "trying",
 }
+
+_KNOWN_ACRONYMS = {
+    "AI", "API", "ASR", "CEO", "CFO", "CIA", "CPU", "CTO", "DNA", "EU", "FBI", "GDP",
+    "GPU", "GPS", "HTML", "HTTP", "HTTPS", "ID", "II", "III", "IV", "IO", "IP", "IT",
+    "JSON", "LAPD", "LED", "LLM", "MIT", "NASA", "NATO", "NBA", "NFL", "NHL", "NLLB",
+    "NSA", "NYPD", "OK", "OS", "PC", "PDA", "PDF", "PR", "RAM", "ROM", "SDK", "SLA",
+    "SMS", "SQL", "SSD", "SSH", "SSL", "STT", "SUV", "SWAT", "TCP", "TLS", "TTS", "TV",
+    "UI", "UK", "UN", "URL", "US", "USA", "USB", "UTF", "UX", "VAD", "VIP", "VPN",
+    "VR", "VRAM", "VTT", "WHO", "WIFI", "WTO", "WWW", "XML",
+}
+
+
+def _normalize_shouting_caps(text: str) -> str:
+    """
+    Chuyển các cụm từ tiếng Anh IN HOA toàn bộ (broadcast closed-caption shouting như
+    'I DIDN'T HAVE A CHOICE', 'DELAYING THE INEVITABLE') về chữ thường chuẩn để tránh làm
+    LLM 3B sinh tiếng Việt IN HOA sai ngữ pháp, trong khi vẫn bảo toàn từ viết tắt (PDA, FBI, AI...).
+    """
+    if not text:
+        return text
+    alpha_words = re.findall(r"[A-Za-z']+", text)
+    if not alpha_words:
+        return text
+    shouting_words = [
+        w for w in alpha_words
+        if len(w.replace("'", "")) >= 2
+        and w.isupper()
+        and w.replace("'S", "") not in _KNOWN_ACRONYMS
+    ]
+    if len(shouting_words) < 2 and not (len(alpha_words) == 1 and len(shouting_words) == 1):
+        return text
+
+    def _replace_word(match: re.Match) -> str:
+        w = match.group(0)
+        if not w.isupper():
+            return w
+        base = w[:-2] if w.endswith("'S") else w
+        if base in _KNOWN_ACRONYMS:
+            return base + ("'s" if w.endswith("'S") else "")
+        low = w.lower()
+        if low == "i":
+            return "I"
+        if low.startswith("i'"):
+            return "I" + low[1:]
+        return low
+
+    out = re.sub(r"[A-Za-z']+", _replace_word, text)
+    # Viết hoa chữ cái đầu câu và sau dấu kết câu (. ! ? —)
+    out = re.sub(
+        r"(^\s*|[.!?—]\s+)([a-z])",
+        lambda m: m.group(1) + m.group(2).upper(),
+        out,
+    )
+    return out
 
 
 @dataclasses.dataclass
@@ -108,9 +175,11 @@ def _clean_caption_text(raw: str, strip_arrows: bool = True) -> str:
 
     if strip_arrows:
         txt = _SPEAKER_ARROW_RE.sub("", txt)
+        txt = _INLINE_ARROW_RE.sub("", txt)
     txt = re.sub(r"\s{2,}", " ", txt).strip()
     if not txt or _MUSIC_TAG_RE.match(txt):
         return ""
+    txt = _normalize_shouting_caps(txt)
 
     alpha_tokens = re.findall(r"[a-zA-Z']+", txt.lower())
     if alpha_tokens and len(alpha_tokens) <= 2 and all(t in _PURE_FILLERS for t in alpha_tokens):
@@ -224,6 +293,69 @@ def _merge_short_manual_fragments(cues: list[tuple[int, int, str]]) -> list[tupl
     return [(s, e, t) for s, e, t in merged]
 
 
+def _merge_asr_orphan_fragments(cues: list[tuple[int, int, str]]) -> list[tuple[int, int, str]]:
+    """
+    Hậu xử lý các câu ASR đã ghép để gom nốt những mảnh 1-2 từ bị cô lập (VD: 'kid.', 'there.', 'off.',
+    'arraignment.', 'Of', 'All', 'Ready to', 'stay alive') vào mệnh đề liền kề nếu khoảng cách gần.
+    """
+    if len(cues) <= 1:
+        return cues
+
+    merged: list[list] = []
+    for s_ms, e_ms, raw_txt in cues:
+        txt = _clean_caption_text(raw_txt)
+        if not txt:
+            continue
+        if not merged:
+            merged.append([s_ms, e_ms, txt])
+            continue
+
+        prev_s, prev_e, prev_txt = merged[-1]
+        gap_ms = max(0, s_ms - prev_e)
+        prev_ends_sentence = prev_txt.endswith(_TERMINAL_PUNCT)
+        cur_ends_sentence = txt.endswith(_TERMINAL_PUNCT) or txt.endswith(_CLAUSE_PUNCT)
+        prev_len = _effective_unit_length(prev_txt)
+        cur_len = _effective_unit_length(txt)
+        prev_tail = _last_ascii_word_lower(prev_txt)
+        cur_head = _first_ascii_word_lower(txt)
+        combined_txt = f"{prev_txt} {txt}".strip()
+        combined_len = _effective_unit_length(combined_txt)
+
+        # Trường hợp 1: Câu trước chưa có dấu chấm kết câu và câu hiện tại chỉ là đuôi 1-2 từ kết câu
+        # (VD: "trying to find son of a killed my" + "kid.", "transferred for his" + "arraignment.")
+        is_orphan_tail = (
+            not prev_ends_sentence
+            and cur_len <= 2.2
+            and combined_len <= 24.0
+            and (
+                (cur_ends_sentence and gap_ms <= 3000)
+                or (prev_tail in _DANGLING_TAIL_WORDS and gap_ms <= 3500)
+                or (gap_ms <= 1800 and combined_len <= 18.0)
+            )
+        )
+        # Trường hợp 2: Câu trước chỉ có 1-2 từ mở đầu chưa kết câu (VD: "Of" + "course, ...", "All" + "right.", "Ready to" + "go.")
+        is_orphan_head = (
+            not prev_ends_sentence
+            and prev_len <= 2.2
+            and combined_len <= 22.0
+            and (
+                (prev_tail in _DANGLING_TAIL_WORDS and gap_ms <= 14500)
+                or (gap_ms <= 2200)
+            )
+        )
+
+        if is_orphan_tail or is_orphan_head:
+            if _CJK_CHAR_RE.search(prev_txt[-1:]) and _CJK_CHAR_RE.search(txt[:1]):
+                merged[-1][2] = f"{prev_txt}{txt}"
+            else:
+                merged[-1][2] = combined_txt
+            merged[-1][1] = max(prev_e, e_ms)
+        else:
+            merged.append([s_ms, e_ms, txt])
+
+    return [(s, e, t) for s, e, t in merged]
+
+
 def _reconstruct_asr_word_cues(word_tokens: list[tuple[int, int, str]]) -> list[CaptionCue]:
     """
     Tái tạo câu hoàn chỉnh từ luồng từ đơn có mốc tOffsetMs của YouTube ASR (khắc phục triệt để
@@ -232,16 +364,29 @@ def _reconstruct_asr_word_cues(word_tokens: list[tuple[int, int, str]]) -> list[
     if not word_tokens:
         return []
 
-    # Khử trùng lặp khi YouTube phát lại dòng cuộn cùng mốc giờ
+    # Khử trùng lặp khi YouTube phát lại dòng cuộn cùng mốc giờ hoặc lặp từ lắp bắp ('I I I', 'here here', 'if ... if')
     deduped: list[tuple[int, int, str]] = []
     for w_start, ev_end, raw_w in word_tokens:
         w = raw_w.replace("\n", " ").strip()
         w = _INLINE_NOISE_TAG_RE.sub("", w).strip()
         w = _INLINE_NOTES_RE.sub("", w).strip()
+        w = _INLINE_ARROW_RE.sub("", w).strip()
         if not w:
             continue
-        if deduped and abs(w_start - deduped[-1][0]) <= 40 and w.lower() == deduped[-1][2].lower():
-            continue
+        if deduped:
+            prev_start, _, prev_w = deduped[-1]
+            dt = abs(w_start - prev_start)
+            if dt <= 40 and w.lower() == prev_w.lower():
+                continue
+            # Khử lắp bắp từ đơn ngắn liên tiếp trong ASR (VD: "I I I", "if ... if", "here here")
+            w_clean_low = w.lower().rstrip(",.!?")
+            prev_clean_low = prev_w.lower().rstrip(",.!?")
+            if (
+                dt <= 1100
+                and w_clean_low == prev_clean_low
+                and w_clean_low in {"i", "a", "the", "to", "if", "and", "in", "on", "of", "here", "we", "you", "he", "she", "it", "they"}
+            ):
+                continue
         deduped.append((max(0, int(w_start)), max(int(w_start) + 250, int(ev_end)), w))
 
     if not deduped:
@@ -293,14 +438,44 @@ def _reconstruct_asr_word_cues(word_tokens: list[tuple[int, int, str]]) -> list[
 
         tail_low = _last_ascii_word_lower(word)
         next_low = _first_ascii_word_lower(next_word)
-        is_dangling_tail = tail_low in _DANGLING_TAIL_WORDS and cur_len < 19.0
+        ends_terminal = word.endswith(_TERMINAL_PUNCT) and not word.lower().endswith(
+            ("mr.", "ms.", "mrs.", "dr.", "vs.", "u.s.", "st.")
+        )
+        is_dangling_tail = (not ends_terminal) and (tail_low in _DANGLING_TAIL_WORDS) and (cur_len < 22.0)
+
+        # Kiểm tra xem từ kế tiếp (hoặc từ thứ 2 kế tiếp) có mang dấu chấm/phẩy kết thúc cụm đang dở không
+        # (Khắc phục triệt để lỗi cắt trước từ cuối câu như: "you were" | "there.", "tipped him" | "off.",
+        #  "Of" | "course,", "for his" | "arraignment.", "All" | "right.", "Ready to" | "go.", "killed my" | "kid.")
+        next_ends_punct = next_word.endswith(_TERMINAL_PUNCT) or next_word.endswith(_CLAUSE_PUNCT)
+        next2_ends_terminal = (
+            (i + 2 < total)
+            and deduped[i + 2][2].endswith(_TERMINAL_PUNCT)
+            and (deduped[i + 2][0] - next_start <= 650)
+        )
+        hold_for_punct_tail = (
+            not ends_terminal
+            and cur_len < 23.0
+            and gap_ms < 4500
+            and (next_ends_punct or (is_dangling_tail and next2_ends_terminal))
+        )
+        hold_for_short_start = (
+            not ends_terminal
+            and cur_len < 2.5
+            and gap_ms < 2500
+        )
+        hold_for_dangling = (
+            is_dangling_tail
+            and gap_ms < 3200
+        )
+
+        if hold_for_punct_tail or hold_for_short_start or hold_for_dangling:
+            continue
 
         # 1. Điều kiện ngắt cứng (khoảng nghỉ dài, dấu kết câu rõ ràng, hoặc chạm trần độ dài)
-        ends_terminal = word.endswith(_TERMINAL_PUNCT)
         hard_split = (
             gap_ms >= 1150
-            or (ends_terminal and cur_len >= 3.5 and not word.lower().endswith(("mr.", "ms.", "dr.", "vs.", "u.s.")))
-            or cur_len >= 20.0
+            or (ends_terminal and cur_len >= 3.0)
+            or cur_len >= 19.0
             or cur_dur >= 6500
         )
 
@@ -309,11 +484,10 @@ def _reconstruct_asr_word_cues(word_tokens: list[tuple[int, int, str]]) -> list[
         soft_split = (
             not is_dangling_tail
             and remaining >= 3
-            and (cur_len >= 11.0 or cur_dur >= 3600)
             and (
-                gap_ms >= 520
-                or word.endswith(_CLAUSE_PUNCT)
-                or (next_low in _CLAUSE_CONJUNCTIONS and cur_len >= 9.0)
+                (word.endswith(_CLAUSE_PUNCT) and cur_len >= 7.5)
+                or (next_low in _CLAUSE_CONJUNCTIONS and cur_len >= 8.5)
+                or ((cur_len >= 11.0 or cur_dur >= 3800) and gap_ms >= 580)
             )
         )
 
@@ -323,7 +497,8 @@ def _reconstruct_asr_word_cues(word_tokens: list[tuple[int, int, str]]) -> list[
             raw_cues.append((seg_start_ms, seg_end_ms, joined_now))
             buf_words = []
 
-    return _finalize_non_overlapping_cues(raw_cues)
+    stitched_cues = _merge_asr_orphan_fragments(raw_cues)
+    return _finalize_non_overlapping_cues(stitched_cues)
 
 
 def _parse_json3(data: dict, is_asr: bool | None = None) -> list[CaptionCue]:
@@ -364,8 +539,10 @@ def _parse_json3(data: dict, is_asr: bool | None = None) -> list[CaptionCue]:
                     continue
                 offset = int(seg.get("tOffsetMs", 0) or 0)
                 w_start = ev_start + max(0, offset)
-                # Nếu 1 seg chứa cụm nhiều từ cách nhau khoảng trắng, tách nhẹ theo bước 180ms
-                raw_str = str(utf8).strip()
+                # Loại bỏ dấu >> đổi người nói trước khi tách từ để >> không thành token riêng
+                raw_str = _INLINE_ARROW_RE.sub(" ", str(utf8)).strip()
+                if not raw_str:
+                    continue
                 parts = raw_str.split()
                 if len(parts) > 1 and not _CJK_CHAR_RE.search(raw_str):
                     step = min(220, max(60, (ev_end - w_start) // max(1, len(parts))))
@@ -662,7 +839,7 @@ class CaptionTranslationWorker(QThread):
 
     BASE_LOOKAHEAD_MS = 90_000
     BASE_URGENT_MS = 8_500
-    BATCH_SIZE = 4
+    BATCH_SIZE = 2
 
     def __init__(
         self,
@@ -685,7 +862,10 @@ class CaptionTranslationWorker(QThread):
 
         self._lock = threading.Lock()
         self._wake_event = threading.Event()
-        self._playhead_ms = max(0, int(initial_playhead_ms or 0))
+        init_ms = max(0, int(initial_playhead_ms or 0))
+        if self.cues and init_ms > self.cues[-1].end_ms + 15_000:
+            init_ms = 0
+        self._playhead_ms = init_ms
         self._playback_rate = max(0.25, min(3.0, float(playback_rate or 1.0)))
         self._paused = False
 
