@@ -12,6 +12,10 @@ ENV/
 # Logs and runtime outputs
 *.log
 app_debug.log
+bridge_token.txt
+interpreter_settings.json
+native_host/com.local_translator.bridge.json
+native_host/launcher.log
 
 # Media / heavy audio & video test files (e.g. sample meeting recordings)
 *.mp4
@@ -35,6 +39,7 @@ meeting_logs/*.mp3
 .coverage
 htmlcov/
 scratch/
+caption_cache/
 
 # OS & Editor files
 .DS_Store
@@ -43,3 +48,4 @@ Thumbs.db
 *.swo
 .vscode/
 .idea/
+

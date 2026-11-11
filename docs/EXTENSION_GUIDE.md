@@ -68,6 +68,54 @@ In `SystemAudioVADWorker.__init__` (paired with `_StreamingAGC` automatic gain n
   - Controlled by `self.preview_before_speak = True` and `self.preview_delay_sec = 1.5`. Increase `preview_delay_sec` (e.g. `2.5`) if users want more reading time before English TTS plays into Zoom/Meet.
 - **Custom Project Glossary (`custom_glossary.txt` & `LocalAIEngine.set_custom_glossary`):**
   - Supports comma/semicolon-separated terms (`Kubernetes, SLA, OKR`) as well as explicit translation mappings (`->`, `=>`, `=`, e.g., `P&L -> Báo cáo lãi lỗ`), automatically feeding both Whisper `initial_prompt` (`_glossary_stt_hint`) and Ollama system/user prompts.
-- **Bilingual Meeting Transcripts (`MeetingTranscriptLogger` in `main.py`):**
-  - Writes timestamped UTF-8 Markdown logs lazily (only creating a file when the first utterance occurs) into `meeting_logs/meeting_YYYY-MM-DD_HH-MM-SS.md`. Cancelled outgoing utterances (`Esc`) are intentionally excluded from confirmed transcripts.
+- **Bilingual Meeting Transcripts (`MeetingTranscriptLogger` in `incoming_pipeline.py`):**
+  - Writes timestamped UTF-8 Markdown logs lazily (only creating a file when the first utterance occurs) into `meeting_logs/meeting_YYYY-MM-DD_HH-MM-SS.md` (or `meeting_logs/video_YYYY-MM-DD_HH-MM-SS.md` when invoked by `BrowserBridgeServer`). Cancelled outgoing utterances (`Esc`) are intentionally excluded from confirmed transcripts.
+
+---
+
+## 6. Adding a New Audio Source (Subclassing `SystemAudioVADWorker` like `TabAudioVADWorker`)
+
+Because `SystemAudioVADWorker._process_audio_stream(audio_chunk_generator)` in `audio_capture.py` encapsulates the entire `_VoiceBandHPF` $\rightarrow$ `_StreamingAGC` $\rightarrow$ `_StreamingSileroVAD` $\rightarrow$ `Smart Valley Split` pipeline, any external audio stream (WebSocket PCM, network RTP, or local media file) can reuse 100% of the VAD segmentation logic by subclassing `SystemAudioVADWorker`.
+
+See `TabAudioVADWorker` in `browser_bridge.py` as the reference pattern:
+
+1. **Subclass `SystemAudioVADWorker` and override `run()`:**
+   ```python
+   from audio_capture import SystemAudioVADWorker, _StreamingResampler
+
+   class CustomStreamVADWorker(SystemAudioVADWorker):
+       def __init__(self, sentence_queue, source_sample_rate: int = 48000, hud_state_callback=None):
+           super().__init__(sentence_queue=sentence_queue, hud_state_callback=hud_state_callback)
+           self.source_sample_rate = int(source_sample_rate)
+           self.resampler = _StreamingResampler(self.source_sample_rate, self.sample_rate)
+   ```
+2. **Convert incoming PCM frames to `16000 Hz`, mono, `np.float32` in `[-1.0, 1.0]`:**
+   - If the source sends little-endian `Int16` mono bytes:
+     ```python
+     pcm_f32 = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+     chunk_16k = self.resampler.process(pcm_f32)
+     ```
+   - Yield `chunk_16k` (and yield `np.zeros(512, dtype=np.float32)` when the source is idle for `>= 120ms` so trailing speech can trigger the silence cut) into `self._process_audio_stream(generator())`.
+3. **Connect to `IncomingInferenceWorker` (`incoming_pipeline.py`):**
+   - Pass the same `sentence_queue` (`queue.Queue`) and `vad_worker` instance to `IncomingInferenceWorker(engine, sentence_queue, vad_worker=custom_vad_worker)`. This automatically enables conjunction stitching (`is_capturing_speech`) and backpressure management (`qsize() > 2`).
+
+---
+
+## 7. Adding a New Field to the Interpreter Summary Payload (`interpreter_summary.py` $\rightarrow$ `overlay_ui.py` $\rightarrow$ `content_script.js`)
+
+To add a new structured field (e.g., `"action_item": "str"`) to the Tier-2 `"🧭 Ý chính đang bàn"` summary card:
+
+1. **Prompt & Validation (`interpreter_summary.py`):**
+   - Update `SUMMARY_SYSTEM_PROMPT` to request the new JSON key in the output schema.
+   - In `validate_summary(data, prev_notes, contains_cjk_fn)`, sanitize the field (strip whitespace, enforce max character length, reject CJK characters via `contains_cjk_fn`) and include it in the returned dict.
+   - In `SummaryWorker.run()`, include the validated field in `self._notes` and in the `payload` emitted via `self.summary_ready.emit(payload)`.
+2. **Desktop Summary Panel (`overlay_ui.py`):**
+   - In `SummaryPanelWindow.__init__`, add a dedicated `QLabel` (with `setWordWrap(True)` and `setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)`).
+   - In `SummaryPanelWindow.update_summary(payload)` and `reset()`, show/hide the label based on whether `payload.get("action_item")` is non-empty, then call `self.adjustSize()` and `self._reposition()`.
+3. **Meeting Transcript Logger (`incoming_pipeline.py`):**
+   - In `MeetingTranscriptLogger.log_summary(payload)`, append the new field under the `> ### 🧭 Tóm tắt ý chính` Markdown block if present.
+4. **Chrome Extension Shadow DOM Card (`chrome_extension/content_script.js` & `overlay.css`):**
+   - Since `BridgeSession._on_summary_ready` forwards `{"type": "summary", **payload}` directly over WebSocket, add a matching DOM node inside `ensureOverlayDom()` (`summaryCardEl`) and populate/toggle it inside `handleBackendEvent()` when `evt.type === "summary"`.
+
+
 

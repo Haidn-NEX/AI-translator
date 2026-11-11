@@ -1,8 +1,10 @@
+import json
 import logging
 import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -12,6 +14,8 @@ import requests
 from hardware_profile import SystemProfile
 
 logger = logging.getLogger("LiveTranslator")
+
+OLLAMA_NUM_CTX = 1024
 
 NLLB_LANG_MAP = {
     "en": "eng_Latn",
@@ -108,6 +112,14 @@ class LocalAIEngine:
         self.source_lang = "en"           # Ngôn ngữ chiều nghe: "auto", "en", "ja", "zh", "ko"
         self._ollama_vulkan_retried = False
         self._http = requests.Session()
+        self._llm_lock = threading.Lock()
+        self._llm_preempt = threading.Event()
+        self._summary_resp_lock = threading.Lock()
+        self._active_summary_resp = None
+        self._active_summary_conn = None
+        self._summary_stream_aborted = False
+        self._http_summary = self._create_summary_session()
+        self.last_translate_preempted_summary = False
 
         # Tự động kiểm tra Ollama đang chạy hoặc đã cài sẵn model trên ổ cứng
         self.ollama_available = (
@@ -343,7 +355,7 @@ class LocalAIEngine:
                 "keep_alive": "30m",
                 "options": {
                     "num_predict": 1,
-                    "num_ctx": 512,
+                    "num_ctx": OLLAMA_NUM_CTX,
                 },
             },
             timeout=35,
@@ -763,7 +775,7 @@ class LocalAIEngine:
         user_parts.append(f"<source>{source_text}</source>")
         user_msg = "\n\n".join(user_parts)
 
-        res = self._call_ollama_chat(system_msg, user_msg)
+        res = self._call_ollama_chat(system_msg, user_msg, num_ctx=OLLAMA_NUM_CTX)
         if res.startswith("[Lỗi Ollama"):
             self._handle_ollama_failure(res)
             return self._translate_nllb(source_text, src_lang=fallback_src_flores, tgt_lang="vie_Latn")
@@ -772,7 +784,7 @@ class LocalAIEngine:
         cleaned = self._clean_translation_output(res, source_text)
         cleaned = self._strip_context_echo(cleaned, source_text)
 
-        # Lớp bảo vệ tức thì (~100ms, giữ nguyên num_ctx=512 để Ollama không bao giờ phải nạp lại VRAM)
+        # Lớp bảo vệ tức thì (~100ms, giữ nguyên OLLAMA_NUM_CTX thống nhất để Ollama không bao giờ phải nạp lại VRAM)
         if (
             self._contains_cjk(cleaned)
             or self._is_untranslated_echo(source_text, cleaned, self.source_lang, self._glossary_ascii_terms)
@@ -797,14 +809,378 @@ class LocalAIEngine:
             user_msg = f"Glossary / Proper nouns to follow: {self.custom_glossary}\n\n<source>{vi_text}</source>"
         else:
             user_msg = f"<source>{vi_text}</source>"
-        res = self._call_ollama_chat(system_msg, user_msg)
+        res = self._call_ollama_chat(system_msg, user_msg, num_ctx=OLLAMA_NUM_CTX)
         if res.startswith("[Lỗi Ollama"):
             self._handle_ollama_failure(res)
             return self._translate_nllb(vi_text, src_lang="vie_Latn", tgt_lang="eng_Latn")
         self._ollama_fail_streak = 0
         return self._clean_translation_output(res, vi_text)
 
-    def _call_ollama_chat(self, system_msg: str, user_msg: str, num_ctx: int = 512) -> str:
+    @staticmethod
+    def _normalize_lang_code(lang: str | None) -> str:
+        raw = (lang or "").strip().lower()
+        if not raw:
+            return "en"
+        if raw.startswith("a.") and len(raw) > 2:
+            raw = raw[2:]
+        base = raw.split("-")[0].split("_")[0]
+        if base in ("en", "ja", "zh", "ko", "vi", "auto"):
+            return base
+        return base
+
+    @classmethod
+    def _resolve_flores_lang(cls, lang: str | None) -> str:
+        base = cls._normalize_lang_code(lang)
+        if base in NLLB_LANG_MAP:
+            return NLLB_LANG_MAP[base]
+        extra = {
+            "fr": "fra_Latn",
+            "de": "deu_Latn",
+            "es": "spa_Latn",
+            "pt": "por_Latn",
+            "it": "ita_Latn",
+            "ru": "rus_Cyrl",
+            "id": "ind_Latn",
+            "nl": "nld_Latn",
+        }
+        return extra.get(base, "eng_Latn")
+
+    @staticmethod
+    def _strip_echo_against_pairs(
+        cleaned: str, source_text: str, prev_pairs: list[tuple[str, str]]
+    ) -> str:
+        if not cleaned or not prev_pairs:
+            return cleaned
+        src_low = (source_text or "").lower()
+        for prev_src, prev_vi in prev_pairs[-2:]:
+            if prev_src and prev_src.strip().lower() in src_low:
+                continue
+            pv = (prev_vi or "").strip().rstrip(".!?,;-")
+            if len(pv) >= 10 and len(cleaned) > len(pv) + 4:
+                if cleaned.lower().startswith(pv.lower()):
+                    cleaned = cleaned[len(pv):].lstrip(" .!?,;-")
+        return re.sub(r"\s*\n+\s*", " ", cleaned).strip()
+
+    @staticmethod
+    def _parse_caption_batch_output(raw_text: str, expected_count: int) -> dict[int, str]:
+        """Giải mã linh hoạt JSON hoặc danh sách đánh số từ LLM về ánh xạ 1-based {1: vi_1, ...}."""
+        out: dict[int, str] = {}
+        txt = (raw_text or "").strip()
+        if not txt or expected_count <= 0:
+            return out
+
+        parsed_obj = None
+        try:
+            parsed_obj = json.loads(txt)
+        except Exception:
+            first_brace = txt.find("{")
+            last_brace = txt.rfind("}")
+            if 0 <= first_brace < last_brace:
+                try:
+                    parsed_obj = json.loads(txt[first_brace : last_brace + 1])
+                except Exception:
+                    parsed_obj = None
+
+        if isinstance(parsed_obj, dict):
+            if (
+                "0" in parsed_obj
+                and str(expected_count) not in parsed_obj
+                and all(str(i) in parsed_obj for i in range(expected_count))
+            ):
+                for i in range(expected_count):
+                    val = parsed_obj.get(str(i))
+                    if isinstance(val, str) and val.strip():
+                        out[i + 1] = val.strip()
+                return out
+
+            for i in range(1, expected_count + 1):
+                val = parsed_obj.get(str(i))
+                if val is None and i in parsed_obj:
+                    val = parsed_obj.get(i)
+                if isinstance(val, str) and val.strip():
+                    out[i] = val.strip()
+            if out:
+                return out
+
+            for list_key in ("translations", "items", "lines", "cues", "result"):
+                arr = parsed_obj.get(list_key)
+                if isinstance(arr, list) and len(arr) == expected_count:
+                    for idx, val in enumerate(arr, start=1):
+                        if isinstance(val, str) and val.strip():
+                            out[idx] = val.strip()
+                    if out:
+                        return out
+        elif isinstance(parsed_obj, list) and len(parsed_obj) == expected_count:
+            for idx, val in enumerate(parsed_obj, start=1):
+                if isinstance(val, str) and val.strip():
+                    out[idx] = val.strip()
+            if out:
+                return out
+
+        for line in txt.splitlines():
+            m = re.match(r"^\s*\[?(\d{1,2})\]?[\.\:\)\-]\s+(.+?)\s*$", line)
+            if m:
+                idx = int(m.group(1))
+                if 1 <= idx <= expected_count and idx not in out:
+                    out[idx] = m.group(2).strip()
+        return out
+
+    def translate_caption_batch(
+        self,
+        items: list[str],
+        prev_context: list[tuple[str, str]] | None = None,
+        next_context: list[str] | None = None,
+        source_lang: str | None = None,
+        urgent: bool = False,
+    ) -> tuple[list[str], float, str]:
+        """
+        Dịch chuẩn ngữ cảnh trước/sau (bidirectional context) cho 1..N câu phụ đề YouTube.
+        - Giữ cố định OLLAMA_NUM_CTX = 1024 (không bao giờ gây reload VRAM).
+        - urgent=True (câu ngay tại playhead): có quyền preempt SummaryWorker để hiện tức thì (< 1s).
+        - urgent=False (dịch đón đầu +90s): xếp hàng lịch sự trên _llm_lock, không cắt ngang SummaryWorker.
+        - Đảm bảo 100% đầu ra khớp số phần tử 1-1 với items và lọc sạch CJK / rò tiếng Anh từng dòng.
+        """
+        if not items:
+            return [], 0.0, ("Ollama" if self.translation_mode == "ollama" else "NLLB")
+
+        t0 = time.perf_counter()
+        eff_lang = self._normalize_lang_code(source_lang or self.source_lang)
+        src_flores = self._resolve_flores_lang(eff_lang)
+        prev_pairs = list(prev_context or [])[-2:]
+        lookahead = [s.strip() for s in (next_context or []) if s and s.strip()][:2]
+
+        if not self._can_use_ollama_now():
+            vi_out = [
+                self._translate_nllb(src_line, src_lang=src_flores, tgt_lang="vie_Latn") if src_line.strip() else ""
+                for src_line in items
+            ]
+            return vi_out, (time.perf_counter() - t0) * 1000.0, "NLLB"
+
+        # Fast-path 1 câu đơn (thường là câu khẩn cấp ngay tại playhead khi mới bật hoặc vừa tua video)
+        if len(items) == 1:
+            src_one = (items[0] or "").strip()
+            if not src_one:
+                return [""], 0.0, "Ollama"
+            system_msg = (
+                "You are a professional video subtitle translator into concise, natural Vietnamese (100% Quốc ngữ). "
+                "RULES:\n"
+                "1. Translate ONLY the text inside <source>...</source>. Use previous/upcoming context ONLY to understand pronouns and incomplete clauses — NEVER translate context lines.\n"
+                "2. Omit spoken fillers ('you know', 'like', 'um', 'uh', 'I mean').\n"
+                "3. NEVER output Chinese/Cyrillic characters. Translate ALL common English words into natural Vietnamese; keep ONLY brand/person/tech proper nouns.\n"
+                "4. Output ONLY the final Vietnamese subtitle line, no tags."
+            )
+            user_parts = []
+            if self.custom_glossary:
+                user_parts.append(f"Glossary / Proper nouns to follow: {self.custom_glossary}")
+            if prev_pairs:
+                ctx_lines = [f"- {s} => {v}" for s, v in prev_pairs]
+                user_parts.append("Previous lines (reference only, do NOT translate):\n" + "\n".join(ctx_lines))
+            user_parts.append(f"<source>{src_one}</source>")
+            if lookahead:
+                nxt_lines = [f"- {s}" for s in lookahead]
+                user_parts.append("Upcoming lines (lookahead only, do NOT translate):\n" + "\n".join(nxt_lines))
+            user_msg = "\n\n".join(user_parts)
+
+            res = self._call_ollama_chat(
+                system_msg,
+                user_msg,
+                num_ctx=OLLAMA_NUM_CTX,
+                num_predict=130,
+                json_mode=False,
+                urgent=urgent,
+                timeout_sec=6.5,
+            )
+            if res.startswith("[Lỗi Ollama"):
+                self._handle_ollama_failure(res)
+                vi_fallback = self._translate_nllb(src_one, src_lang=src_flores, tgt_lang="vie_Latn")
+                return [vi_fallback], (time.perf_counter() - t0) * 1000.0, "NLLB"
+
+            self._ollama_fail_streak = 0
+            cleaned = self._clean_translation_output(res, src_one)
+            cleaned = self._strip_echo_against_pairs(cleaned, src_one, prev_pairs)
+            echo_check_lang = "en" if eff_lang in ("en", "auto") else eff_lang
+            if (
+                not cleaned
+                or self._contains_cjk(cleaned)
+                or self._is_untranslated_echo(src_one, cleaned, echo_check_lang, self._glossary_ascii_terms)
+            ):
+                vi_fallback = self._translate_nllb(src_one, src_lang=src_flores, tgt_lang="vie_Latn")
+                return [vi_fallback], (time.perf_counter() - t0) * 1000.0, "NLLB"
+            return [cleaned], (time.perf_counter() - t0) * 1000.0, "Ollama"
+
+        # Batch 2..N câu với JSON có khóa đánh số tường minh để giữ căn chỉnh mốc thời gian 1-1
+        expected_keys = ", ".join(f'"{i}"' for i in range(1, len(items) + 1))
+        system_msg = (
+            "You are a professional video subtitle translator into concise, natural Vietnamese (100% Quốc ngữ). "
+            "RULES:\n"
+            f"1. Translate EACH numbered subtitle in <batch>...</batch> into natural Vietnamese and return a JSON object with EXACT keys {expected_keys}.\n"
+            "2. NEVER merge two numbered items into one and NEVER omit any key. Each key must translate ONLY its corresponding numbered line, using surrounding lines and context only to resolve pronouns, grammar, and meaning.\n"
+            "3. Omit spoken fillers ('you know', 'like', 'um', 'uh', 'I mean'). NEVER output Chinese/Cyrillic characters. Translate ALL common English words into natural Vietnamese; keep ONLY brand/person/tech proper nouns.\n"
+            '4. Return ONLY valid JSON, e.g. {"1": "...", "2": "..."}.'
+        )
+        user_parts = []
+        if self.custom_glossary:
+            user_parts.append(f"Glossary / Proper nouns to follow: {self.custom_glossary}")
+        if prev_pairs:
+            ctx_lines = [f"- {s} => {v}" for s, v in prev_pairs]
+            user_parts.append("Previous context (do NOT include in JSON):\n" + "\n".join(ctx_lines))
+        batch_lines = [f"[{idx}] {line.strip()}" for idx, line in enumerate(items, start=1)]
+        user_parts.append("<batch>\n" + "\n".join(batch_lines) + "\n</batch>")
+        if lookahead:
+            nxt_lines = [f"- {s}" for s in lookahead]
+            user_parts.append("Upcoming lookahead (do NOT include in JSON):\n" + "\n".join(nxt_lines))
+        user_msg = "\n\n".join(user_parts)
+
+        res = self._call_ollama_chat(
+            system_msg,
+            user_msg,
+            num_ctx=OLLAMA_NUM_CTX,
+            num_predict=min(320, max(160, 72 * len(items))),
+            json_mode=True,
+            urgent=urgent,
+            timeout_sec=9.5,
+        )
+        if res.startswith("[Lỗi Ollama"):
+            self._handle_ollama_failure(res)
+            vi_out = [
+                self._translate_nllb(src_line, src_lang=src_flores, tgt_lang="vie_Latn") if src_line.strip() else ""
+                for src_line in items
+            ]
+            return vi_out, (time.perf_counter() - t0) * 1000.0, "NLLB"
+
+        self._ollama_fail_streak = 0
+        parsed_map = self._parse_caption_batch_output(res, len(items))
+        echo_check_lang = "en" if eff_lang in ("en", "auto") else eff_lang
+
+        final_out: list[str] = []
+        rolling_pairs = list(prev_pairs)
+        ollama_ok_count = 0
+        for idx, src_line in enumerate(items, start=1):
+            src_stripped = (src_line or "").strip()
+            if not src_stripped:
+                final_out.append("")
+                continue
+            raw_vi = parsed_map.get(idx, "")
+            cleaned = self._clean_translation_output(raw_vi, src_stripped) if raw_vi else ""
+            if cleaned:
+                cleaned = self._strip_echo_against_pairs(cleaned, src_stripped, rolling_pairs)
+
+            duplicate_of_prev = (
+                bool(cleaned)
+                and bool(final_out)
+                and len(cleaned.split()) >= 3
+                and cleaned.lower() == final_out[-1].lower()
+                and src_stripped.lower() != (items[idx - 2] or "").strip().lower()
+            )
+            invalid = (
+                not cleaned
+                or duplicate_of_prev
+                or self._contains_cjk(cleaned)
+                or self._is_untranslated_echo(
+                    src_stripped, cleaned, echo_check_lang, self._glossary_ascii_terms
+                )
+            )
+            if invalid:
+                rescued = self._translate_nllb(src_stripped, src_lang=src_flores, tgt_lang="vie_Latn")
+                final_out.append(rescued)
+                if rescued and not self._contains_cjk(rescued):
+                    rolling_pairs.append((src_stripped, rescued))
+            else:
+                final_out.append(cleaned)
+                ollama_ok_count += 1
+                rolling_pairs.append((src_stripped, cleaned))
+
+        engine_label = "Ollama" if ollama_ok_count > 0 else "NLLB"
+        return final_out, (time.perf_counter() - t0) * 1000.0, engine_label
+
+    def _create_summary_session(self) -> requests.Session:
+        session = requests.Session()
+        try:
+            adapter = session.get_adapter(self.ollama_chat_url)
+            pool = adapter.poolmanager.connection_from_url(self.ollama_chat_url)
+            orig_get_conn = pool._get_conn
+            orig_new_conn = pool._new_conn
+
+            def _bind_conn(conn):
+                if not getattr(conn, "_summary_tracked", False):
+                    orig_connect = conn.connect
+
+                    def _tracked_connect():
+                        res = orig_connect()
+                        with self._summary_resp_lock:
+                            self._active_summary_conn = conn
+                        return res
+
+                    conn.connect = _tracked_connect
+                    conn._summary_tracked = True
+                with self._summary_resp_lock:
+                    self._active_summary_conn = conn
+                return conn
+
+            def _tracked_get_conn(timeout=None):
+                return _bind_conn(orig_get_conn(timeout=timeout))
+
+            def _tracked_new_conn():
+                return _bind_conn(orig_new_conn())
+
+            pool._get_conn = _tracked_get_conn
+            pool._new_conn = _tracked_new_conn
+        except Exception:
+            pass
+        return session
+
+    def _abort_active_summary_stream(self) -> bool:
+        """Đóng ngay kết nối stream tóm tắt đang chạy để nhường GPU/Ollama tức thì cho dòng phụ đề trực tiếp."""
+        with self._summary_resp_lock:
+            conn = self._active_summary_conn
+            resp = self._active_summary_resp
+            self._active_summary_conn = None
+            self._active_summary_resp = None
+            had_active = (conn is not None) or (resp is not None)
+            if had_active:
+                self._summary_stream_aborted = True
+
+        if conn is not None:
+            sock = getattr(conn, "sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        if resp is not None:
+            raw = getattr(resp, "raw", None)
+            if raw is not None:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+        return had_active
+
+    def _call_ollama_chat(
+        self,
+        system_msg: str,
+        user_msg: str,
+        num_ctx: int = OLLAMA_NUM_CTX,
+        *,
+        num_predict: int = 120,
+        json_mode: bool = False,
+        urgent: bool = True,
+        timeout_sec: float = 6.5,
+    ) -> str:
         payload = {
             "model": self.ollama_model,
             "messages": [
@@ -818,23 +1194,215 @@ class LocalAIEngine:
                 "top_p": 0.85,
                 "top_k": 15,
                 "repeat_penalty": 1.1,
-                "num_predict": 120,
+                "num_predict": int(num_predict),
                 "num_ctx": num_ctx,
             },
         }
+        if json_mode:
+            payload["format"] = "json"
+
+        preempted_active = False
+        if urgent:
+            self._llm_preempt.set()
+            preempted_active = self._abort_active_summary_stream()
+        elif self._llm_preempt.is_set():
+            # Nhường làn cho yêu cầu trực tiếp (F8 hoặc câu ngay tại playhead) vào trước
+            time.sleep(0.05)
+
+        with self._llm_lock:
+            self.last_translate_preempted_summary = preempted_active
+            if urgent:
+                self._llm_preempt.clear()
+            try:
+                # Suy luận trực tiếp sau warmup chỉ tốn ~0.4-1.2s; giới hạn timeout 6.5s để không bao giờ treo phụ đề 20s
+                resp = self._http.post(self.ollama_chat_url, json=payload, timeout=timeout_sec)
+                if resp.status_code >= 500 and platform.system() == "Windows" and not self._ollama_vulkan_retried:
+                    self._ollama_vulkan_retried = True
+                    logger.warning("Phát hiện lỗi HTTP 500 từ Ollama CUDA, đang tự khởi động lại sang GPU Vulkan...")
+                    if self._start_or_restart_ollama(use_vulkan=True):
+                        resp = self._http.post(self.ollama_chat_url, json=payload, timeout=15)
+                resp.raise_for_status()
+                msg = resp.json().get("message", {})
+                return msg.get("content", "").strip()
+            except Exception as e:
+                return f"[Lỗi Ollama ({self.ollama_model}): {e}]"
+
+    def generate_summary_json(
+        self,
+        system_msg: str,
+        user_msg: str,
+        max_wall_sec: float = 8.0,
+    ) -> tuple[dict | None, dict]:
+        """Trả (data | None, meta). meta = {ok, preempted, busy, error, prompt_ms, total_ms, raw}"""
+        meta = {
+            "ok": False,
+            "preempted": False,
+            "busy": False,
+            "error": "",
+            "prompt_ms": 0.0,
+            "total_ms": 0.0,
+            "raw": "",
+        }
+        if not self._can_use_ollama_now():
+            meta["error"] = "no_ollama"
+            return None, meta
+
+        if self._llm_preempt.is_set():
+            meta["preempted"] = True
+            meta["busy"] = True
+            meta["error"] = "preempted"
+            return None, meta
+
+        if not self._llm_lock.acquire(blocking=False):
+            meta["busy"] = True
+            meta["error"] = "busy"
+            return None, meta
+
+        t0 = time.perf_counter()
+        resp = None
+        chunks: list[str] = []
+        need_reset_session = False
         try:
-            # Suy luận trực tiếp sau warmup chỉ tốn ~0.4-1.2s; giới hạn timeout 6.5s để không bao giờ treo phụ đề 20s
-            resp = self._http.post(self.ollama_chat_url, json=payload, timeout=6.5)
-            if resp.status_code >= 500 and platform.system() == "Windows" and not self._ollama_vulkan_retried:
-                self._ollama_vulkan_retried = True
-                logger.warning("Phát hiện lỗi HTTP 500 từ Ollama CUDA, đang tự khởi động lại sang GPU Vulkan...")
-                if self._start_or_restart_ollama(use_vulkan=True):
-                    resp = self._http.post(self.ollama_chat_url, json=payload, timeout=15)
+            if self._llm_preempt.is_set():
+                meta["preempted"] = True
+                meta["error"] = "preempted"
+                return None, meta
+
+            with self._summary_resp_lock:
+                self._summary_stream_aborted = False
+
+            payload = {
+                "model": self.ollama_model,
+                "messages": [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                ],
+                "stream": True,
+                "format": "json",
+                "keep_alive": "30m",
+                "options": {
+                    "temperature": 0.2,
+                    "top_p": 0.9,
+                    "top_k": 30,
+                    "repeat_penalty": 1.1,
+                    "num_predict": 220,
+                    "num_ctx": OLLAMA_NUM_CTX,
+                },
+            }
+
+            resp = self._http_summary.post(
+                self.ollama_chat_url,
+                json=payload,
+                stream=True,
+                timeout=(3.0, max_wall_sec),
+            )
+            with self._summary_resp_lock:
+                self._active_summary_resp = resp
+
+            if self._llm_preempt.is_set() or self._summary_stream_aborted:
+                need_reset_session = True
+                meta["preempted"] = True
+                meta["error"] = "preempted"
+                meta["total_ms"] = (time.perf_counter() - t0) * 1000.0
+                return None, meta
+
             resp.raise_for_status()
-            msg = resp.json().get("message", {})
-            return msg.get("content", "").strip()
+
+            for line in resp.iter_lines(decode_unicode=True):
+                now_el = time.perf_counter() - t0
+                if self._llm_preempt.is_set() or self._summary_stream_aborted:
+                    need_reset_session = True
+                    meta["preempted"] = True
+                    meta["error"] = "preempted"
+                    meta["raw"] = "".join(chunks).strip()
+                    meta["total_ms"] = now_el * 1000.0
+                    return None, meta
+
+                if now_el > max_wall_sec:
+                    need_reset_session = True
+                    meta["error"] = "timeout"
+                    meta["raw"] = "".join(chunks).strip()
+                    meta["total_ms"] = now_el * 1000.0
+                    return None, meta
+
+                if not line:
+                    continue
+
+                chunk = json.loads(line)
+                piece = chunk.get("message", {}).get("content", "")
+                if piece:
+                    if meta["prompt_ms"] == 0.0:
+                        meta["prompt_ms"] = (time.perf_counter() - t0) * 1000.0
+                    chunks.append(piece)
+
+                if chunk.get("done"):
+                    break
+
+            meta["total_ms"] = (time.perf_counter() - t0) * 1000.0
+            if meta["prompt_ms"] == 0.0:
+                meta["prompt_ms"] = meta["total_ms"]
+            raw_text = "".join(chunks).strip()
+            meta["raw"] = raw_text
+
+            if self._llm_preempt.is_set() or self._summary_stream_aborted:
+                need_reset_session = True
+                meta["preempted"] = True
+                meta["error"] = "preempted"
+                return None, meta
+
+            data = None
+            try:
+                data = json.loads(raw_text)
+            except Exception:
+                start_idx = raw_text.find("{")
+                end_idx = raw_text.rfind("}")
+                if 0 <= start_idx < end_idx:
+                    try:
+                        data = json.loads(raw_text[start_idx : end_idx + 1])
+                    except Exception:
+                        data = None
+
+            if not isinstance(data, dict):
+                meta["ok"] = False
+                meta["error"] = "bad_json"
+                return None, meta
+
+            meta["ok"] = True
+            meta["error"] = ""
+            return data, meta
+
         except Exception as e:
-            return f"[Lỗi Ollama ({self.ollama_model}): {e}]"
+            need_reset_session = True
+            meta["total_ms"] = (time.perf_counter() - t0) * 1000.0
+            meta["raw"] = "".join(chunks).strip()
+            if self._llm_preempt.is_set() or self._summary_stream_aborted:
+                meta["preempted"] = True
+                meta["error"] = "preempted"
+            elif isinstance(e, requests.Timeout) or (time.perf_counter() - t0) >= max_wall_sec:
+                meta["error"] = "timeout"
+            else:
+                meta["error"] = f"http_error: {e}"
+            return None, meta
+
+        finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+            with self._summary_resp_lock:
+                self._active_summary_resp = None
+                self._active_summary_conn = None
+                if self._summary_stream_aborted:
+                    need_reset_session = True
+                self._summary_stream_aborted = False
+            if need_reset_session:
+                try:
+                    self._http_summary.close()
+                except Exception:
+                    pass
+                self._http_summary = self._create_summary_session()
+            self._llm_lock.release()
 
     def _call_ollama(self, prompt: str) -> str:
         """Giữ tương thích ngược cho các tiện ích mở rộng gọi trực tiếp _call_ollama(prompt)"""

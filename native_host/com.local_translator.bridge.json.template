@@ -1,0 +1,10 @@
+{
+  "name": "com.local_translator.bridge",
+  "description": "Local AI Live Translator launcher",
+  "path": "__LAUNCHER_PATH__",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://__EXTENSION_ID__/"
+  ]
+}
+

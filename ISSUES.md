@@ -64,3 +64,4 @@
 1. **Tính ổn định:** Độ trễ dịch thuật của Ollama không tăng quá 15% so với mức hiện tại (~0.6s – 1.0s/câu).
 2. **Tuân thủ đại từ & văn phong:** Model chuyển đổi chính xác đại từ nhân xưng và thuật ngữ chỉ định theo bối cảnh đã nhập trong ít nhất 85% các câu thử nghiệm.
 3. **Không phá vỡ Invariants:** Không gây tràn VRAM trên GTX 1070 8GB, không làm rơi vào vòng lặp fallback NLLB liên tục, không gây lỗi nạp lại Ollama runner giữa phiên họp.
+

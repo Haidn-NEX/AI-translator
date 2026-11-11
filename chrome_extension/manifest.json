@@ -1,0 +1,97 @@
+{
+  "manifest_version": 3,
+  "name": "Local AI Live Translator — Phụ đề Video",
+  "version": "1.0.0",
+  "description": "Dịch phụ đề tiếng Việt thời gian thực cho video trên tab, chạy 100% trên máy (Whisper + Ollama/NLLB).",
+  "permissions": [
+    "tabCapture",
+    "offscreen",
+    "storage",
+    "activeTab",
+    "scripting",
+    "nativeMessaging",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "service_worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Local AI Live Translator — Nhấn Alt+Shift+T để dịch video",
+    "default_icon": {
+      "16": "icons/16.png",
+      "32": "icons/32.png",
+      "48": "icons/48.png",
+      "128": "icons/128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/16.png",
+    "32": "icons/32.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  },
+  "options_page": "options.html",
+  "commands": {
+    "toggle-translate": {
+      "suggested_key": {
+        "default": "Alt+Shift+T"
+      },
+      "description": "Bật/Tắt dịch video trên tab này"
+    },
+    "toggle-source-line": {
+      "suggested_key": {
+        "default": "Alt+Shift+S"
+      },
+      "description": "Ẩn/Hiện dòng phụ đề gốc"
+    },
+    "toggle-overlay": {
+      "suggested_key": {
+        "default": "Alt+Shift+H"
+      },
+      "description": "Ẩn/Hiện khung phụ đề (vẫn dịch ngầm)"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.youtube.com/*"
+      ],
+      "js": [
+        "yt_caption_hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content_script.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "overlay.css",
+        "subtitle_pacer.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxbbi+KkTR9KUgQ5ntcOh+YdlQyH+3LqYdlQyEAEjRWeJq83vxbbi+KkTR9KUgQ5ntcOh+YdlQyH+3LqYdlQyEAEjRWeJq83vxbbi+KkTR9KUgQ5ntcOh+YdlQyH+3LqYdlQyEAEjRWeJq83vxbbi+KkTR9KUgQ5ntcOh+YdlQyH+3LqYdlQyEAEjRWeJq83vxbbi+KkTR9KUgQ5ntcOh+YdlQyH+3LqYdlQyEAEjRWeJq83vxbbi+KkTR9KUgQ5ntcOh+YdlQyH+3LqYdlQyEAEjRWeJq83vxbbi+KkTR9KUgQ5ntcOh+YdlQyH+3LqYdlQyEAEjRWeJq83vxbbi+KkTR9KUgQ5ntcOh+YdlQyH+3LqYdlQyEAEjRWeJq83vAgMBAAE=",
+  "minimum_chrome_version": "116"
+}
+

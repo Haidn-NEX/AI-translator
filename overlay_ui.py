@@ -386,3 +386,253 @@ class SubtitleOverlayWindow(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_pos = None
+
+
+class SummaryPanelWindow(QWidget):
+    """
+    Cửa sổ Tầng 2 — "🧭 Ý chính đang bàn" (Chế độ Phiên dịch viên Cabin).
+    Neo mặc định ở mép phải màn hình, phía trên SubtitleOverlayWindow, không giao cắt với ControlBar & Overlay.
+    """
+
+    _TRIGGER_LABELS = {
+        "interval": "⏱ chu kỳ",
+        "pause": "⏸ nhịp nghỉ",
+        "manual": "✋ thủ công",
+        "cap": "⛑ chốt an toàn",
+    }
+
+    def __init__(self, max_points_shown: int = 4):
+        super().__init__()
+        self.setWindowTitle("AI Live Interpreter Summary Panel")
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFixedWidth(385)
+        self.max_points_shown = max(1, int(max_points_shown))
+        self._drag_pos = None
+        self._hide_from_capture = (platform.system() == "Windows")
+        self._last_summary_mono: float | None = None
+        self._last_trigger: str = "interval"
+        self._last_latency_sec: float = 0.0
+
+        self._highlight_timer = QTimer(self)
+        self._highlight_timer.setSingleShot(True)
+        self._highlight_timer.timeout.connect(self._clear_new_highlights)
+
+        self._footer_timer = QTimer(self)
+        self._footer_timer.setInterval(1000)
+        self._footer_timer.timeout.connect(self._refresh_footer_text)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 6, 10, 6)
+
+        self.container = QWidget(self)
+        self.container.setStyleSheet("""
+            QWidget {
+                background-color: rgba(15, 23, 42, 212);
+                border: 1px solid rgba(125, 211, 252, 70);
+                border-radius: 11px;
+            }
+        """)
+        box_layout = QVBoxLayout(self.container)
+        box_layout.setContentsMargins(12, 10, 12, 10)
+        box_layout.setSpacing(5)
+
+        self.topic_label = QLabel("📌 Chủ đề: (Đang lắng nghe để tổng hợp ý chính...)")
+        self.topic_label.setWordWrap(True)
+        self.topic_label.setStyleSheet(
+            "color: #38bdf8; font-size: 13px; font-weight: bold; background: transparent; border: none;"
+        )
+        box_layout.addWidget(self.topic_label)
+
+        self.point_labels: list[QLabel] = []
+        for _ in range(self.max_points_shown):
+            lbl = QLabel("")
+            lbl.setWordWrap(True)
+            lbl.setVisible(False)
+            lbl.setStyleSheet(self._point_style(highlighted=False))
+            box_layout.addWidget(lbl)
+            self.point_labels.append(lbl)
+
+        self.question_label = QLabel("")
+        self.question_label.setWordWrap(True)
+        self.question_label.setVisible(False)
+        self.question_label.setStyleSheet(
+            "color: #fb923c; background-color: rgba(154, 52, 18, 85); "
+            "border: 1px solid rgba(251, 146, 60, 120); border-radius: 6px; "
+            "padding: 4px 6px; font-size: 12.5px; font-weight: bold;"
+        )
+        box_layout.addWidget(self.question_label)
+
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        self.status_label.setVisible(False)
+        self.status_label.setStyleSheet(
+            "color: #fde047; font-size: 11.5px; font-style: italic; background: transparent; border: none;"
+        )
+        box_layout.addWidget(self.status_label)
+
+        self.footer_label = QLabel("─ Chưa có bản tổng hợp")
+        self.footer_label.setStyleSheet(
+            "color: #94a3b8; font-size: 11px; background: transparent; border: none; padding-top: 2px;"
+        )
+        box_layout.addWidget(self.footer_label)
+
+        layout.addWidget(self.container)
+        self.resize(385, 130)
+        self.position_at_right_above_overlay()
+
+    @staticmethod
+    def _point_style(highlighted: bool) -> str:
+        if highlighted:
+            return (
+                "color: #fef08a; background-color: rgba(234, 179, 8, 48); "
+                "border-left: 3px solid #facc15; border-radius: 4px; "
+                "padding: 3px 6px; font-size: 12.5px; font-weight: 600;"
+            )
+        return (
+            "color: #f1f5f9; background: transparent; border: none; "
+            "padding: 2px 4px; font-size: 12.5px;"
+        )
+
+    def position_at_right_above_overlay(self):
+        """Đặt ở mép phải màn hình, phía trên SubtitleOverlayWindow và bên dưới ControlBar (Intersects: False)."""
+        screen = QGuiApplication.primaryScreen()
+        if screen:
+            avail = screen.availableGeometry()
+            x = avail.x() + avail.width() - self.width() - 16
+            # SubtitleOverlayWindow cao ~195-230px ở sát đáy (cách đáy 35px); đặt SummaryPanelWindow phía trên đó
+            bottom_anchor = avail.y() + avail.height() - 245
+            y = max(avail.y() + 330, bottom_anchor - self.height())
+            self.move(max(0, x), max(0, y))
+
+    def _sync_height(self):
+        if self._drag_pos is not None:
+            return
+        if self.layout() is not None:
+            self.layout().activate()
+        hint_h = max(105, min(320, self.sizeHint().height()))
+        cur_h = self.height()
+        if abs(hint_h - cur_h) >= 4:
+            bottom_y = self.y() + cur_h
+            new_y = max(0, bottom_y - hint_h)
+            self.setGeometry(self.x(), new_y, self.width(), hint_h)
+
+    def _clear_new_highlights(self):
+        for lbl in self.point_labels:
+            if lbl.isVisible():
+                lbl.setStyleSheet(self._point_style(highlighted=False))
+
+    def _refresh_footer_text(self):
+        if self._last_summary_mono is None:
+            return
+        elapsed_s = max(0, int(time.monotonic() - self._last_summary_mono))
+        trig_txt = self._TRIGGER_LABELS.get(self._last_trigger, self._last_trigger)
+        self.footer_label.setText(
+            f"─ Cập nhật {elapsed_s}s trước · {trig_txt} · {self._last_latency_sec:.1f}s"
+        )
+
+    def update_summary(self, payload: dict):
+        if not isinstance(payload, dict):
+            return
+        mode = str(payload.get("mode") or "interval")
+        if mode == "off" and payload.get("trigger") != "manual":
+            self.hide()
+            return
+
+        topic = str(payload.get("topic") or "").strip() or "(Đang cập nhật chủ đề...)"
+        self.topic_label.setText(f"📌 Chủ đề: {topic}")
+
+        points = [str(p).strip() for p in (payload.get("points") or []) if str(p).strip()]
+        new_count = max(0, int(payload.get("new_count", 0) or 0))
+
+        self._highlight_timer.stop()
+        for idx, lbl in enumerate(self.point_labels):
+            if idx < len(points):
+                lbl.setText(f"• {points[idx]}")
+                lbl.setStyleSheet(self._point_style(highlighted=(idx < new_count)))
+                lbl.setVisible(True)
+            else:
+                lbl.setText("")
+                lbl.setVisible(False)
+
+        if new_count > 0:
+            self._highlight_timer.start(4000)
+
+        question = str(payload.get("question") or "").strip()
+        if question:
+            self.question_label.setText(f"❓ Đang hỏi bạn: {question}")
+            self.question_label.setVisible(True)
+        else:
+            self.question_label.setText("")
+            self.question_label.setVisible(False)
+
+        self._last_summary_mono = time.monotonic()
+        self._last_trigger = str(payload.get("trigger") or "interval")
+        self._last_latency_sec = float(payload.get("latency_ms", 0) or 0) / 1000.0
+        self._refresh_footer_text()
+        if not self._footer_timer.isActive():
+            self._footer_timer.start()
+
+        if not self.isVisible():
+            self.show()
+        self._sync_height()
+
+    def set_status(self, text: str):
+        msg = (text or "").strip()
+        if msg:
+            self.status_label.setText(msg)
+            self.status_label.setVisible(True)
+        else:
+            self.status_label.setText("")
+            self.status_label.setVisible(False)
+        self._sync_height()
+
+    def reset(self):
+        self._highlight_timer.stop()
+        self._footer_timer.stop()
+        self._last_summary_mono = None
+        self.topic_label.setText("📌 Chủ đề: (Đang lắng nghe để tổng hợp ý chính...)")
+        for lbl in self.point_labels:
+            lbl.setText("")
+            lbl.setVisible(False)
+        self.question_label.setText("")
+        self.question_label.setVisible(False)
+        self.status_label.setText("")
+        self.status_label.setVisible(False)
+        self.footer_label.setText("─ Chưa có bản tổng hợp")
+        self._sync_height()
+
+    def set_hide_from_capture(self, enabled: bool) -> bool:
+        self._hide_from_capture = bool(enabled)
+        return apply_window_capture_stealth(self, self._hide_from_capture)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._hide_from_capture:
+            apply_window_capture_stealth(self, True)
+
+    def set_click_through(self, enabled: bool):
+        pos = self.pos()
+        was_visible = self.isVisible()
+        self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, enabled)
+        self.move(pos)
+        if was_visible:
+            self.show()
+        if self._hide_from_capture:
+            apply_window_capture_stealth(self, True)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos is not None and (event.buttons() & Qt.MouseButton.LeftButton):
+            self.move(event.globalPosition().toPoint() - self._drag_pos)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = None

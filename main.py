@@ -13,274 +13,36 @@ from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout,
-    QPushButton, QComboBox, QCheckBox, QLabel, QLineEdit
+    QPushButton, QComboBox, QCheckBox, QLabel, QLineEdit,
+    QDoubleSpinBox, QSpinBox
 )
 from hardware_profile import detect_hardware_profile
 from audio_capture import SystemAudioVADWorker, MicPushToTalkRecorder
 from ai_engine import LocalAIEngine
 from tts_virtual_mic import VirtualMicTTSRouter
-from overlay_ui import SubtitleOverlayWindow, apply_window_capture_stealth
-
-# Đảm bảo console Windows hỗ trợ in tiếng Việt UTF-8 không bị lỗi charmap cp1252
-if hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-# Thiết lập ghi log ra cả file app_debug.log và console để dễ dàng kiểm tra lỗi
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE = os.path.join(APP_DIR, "app_debug.log")
-GLOSSARY_FILE = os.path.join(APP_DIR, "custom_glossary.txt")
-MEETING_LOGS_DIR = os.path.join(APP_DIR, "meeting_logs")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
+from overlay_ui import SubtitleOverlayWindow, SummaryPanelWindow, apply_window_capture_stealth
+from incoming_pipeline import (
+    APP_DIR,
+    LOG_FILE,
+    GLOSSARY_FILE,
+    MEETING_LOGS_DIR,
+    _PURE_FILLERS,
+    _BARE_CONJUNCTIONS,
+    _DANGLING_CONNECTORS,
+    setup_logging,
+    IncomingInferenceWorker,
+    MeetingTranscriptLogger,
 )
-logger = logging.getLogger("LiveTranslator")
+from interpreter_summary import (
+    SUMMARY_SETTINGS_FILE,
+    SummarySettings,
+    SummaryWorker,
+)
+from browser_bridge import BrowserBridgeServer
 
+SUMMARY_SETTINGS_PATH = os.path.join(APP_DIR, SUMMARY_SETTINGS_FILE)
 
-# Từ đệm ngập ngừng vô nghĩa (không dịch thành "Em..." / "Ừm..." gây rác phụ đề)
-_PURE_FILLERS = {"um", "uh", "erm", "er", "hmm", "hm", "uhh", "umm"}
-# Liên từ nối câu cần chờ vế sau thay vì dịch trơ trọi một chữ "Và..." / "Nhưng..."
-_BARE_CONJUNCTIONS = {"but", "and", "so", "or", "because", "while"}
-_DANGLING_CONNECTORS = _BARE_CONJUNCTIONS | {
-    "well", "and uh", "so uh", "but uh", "and um", "so um", "but um",
-    "or uh", "or um", "because uh", "because um",
-}
-
-
-class IncomingInferenceWorker(QThread):
-    result_ready = pyqtSignal(str, str, float, float)
-    source_ready = pyqtSignal(str)
-    status_update = pyqtSignal(str)
-    mode_synced = pyqtSignal(str)
-
-    def __init__(self, sentence_queue: queue.Queue, engine: LocalAIEngine, is_vad_speaking_fn=None):
-        super().__init__()
-        self.sentence_queue = sentence_queue
-        self.engine = engine
-        self.is_vad_speaking_fn = is_vad_speaking_fn
-        self.running = True
-        self.is_loading_models = True
-
-    @staticmethod
-    def _is_pure_filler(text: str, source_lang: str) -> bool:
-        if source_lang not in ("en", "auto"):
-            return False
-        tokens = re.findall(r"[a-zA-Z']+", text.lower())
-        return bool(tokens) and len(tokens) <= 2 and all(t in _PURE_FILLERS for t in tokens)
-
-    @staticmethod
-    def _is_dangling_fragment(text: str, source_lang: str) -> bool:
-        if source_lang not in ("en", "auto"):
-            return False
-        stripped = text.strip()
-        if stripped.endswith("?"):
-            return False
-        words = stripped.split()
-        if len(words) > 2:
-            return False
-        clean = " ".join(re.findall(r"[a-zA-Z']+", stripped.lower()))
-        return clean in _DANGLING_CONNECTORS or (len(words) <= 2 and stripped.endswith("..."))
-
-    @staticmethod
-    def _stitch_prefix(prefix: str, current: str) -> str:
-        p = re.sub(r"[\s,.…]+$", "", prefix.strip())
-        p_parts = p.split()
-        if len(p_parts) >= 2 and re.sub(r"[^\w]", "", p_parts[-1].lower()) in _PURE_FILLERS:
-            p = " ".join(p_parts[:-1]).rstrip(" ,.")
-        cur = current.lstrip()
-        if cur.startswith("..."):
-            cur = cur[3:].lstrip()
-        return f"{p} {cur}".strip()
-
-    def run(self):
-        self.is_loading_models = True
-        self.status_update.emit(
-            f"⏳ Đang tải/nạp model STT ({self.engine.stt_model_name})... (Lần đầu tải ~1.5GB mất 1-2 phút)"
-        )
-        try:
-            self.engine.load_stt_model()
-            if self.engine.translation_mode == "ollama":
-                self.status_update.emit(f"⏳ Đang nạp sẵn model dịch Ollama ({self.engine.ollama_model}) lên VRAM...")
-                self.engine.warmup_ollama()
-            # Nạp sẵn luôn NLLB-200 INT8 (~600MB) để làm chốt chặn 0ms trễ khi cần lọc chữ Hán hoặc dự phòng offline
-            self.status_update.emit("⏳ Đang nạp bộ lọc từ vựng NLLB-200 INT8 (~600MB)...")
-            self.engine._ensure_nllb_loaded("eng_Latn")
-            self.engine._ensure_nllb_loaded("vie_Latn")
-            self.mode_synced.emit(self.engine.translation_mode)
-            self.is_loading_models = False
-            active_trans = (
-                f"Ollama {self.engine.ollama_model}"
-                if self.engine.translation_mode == "ollama"
-                else "NLLB-200 INT8"
-            )
-            self.status_update.emit(f"✅ Sẵn sàng 2 Chiều ({active_trans})! Đang lắng nghe âm thanh hệ thống & phím [F8]...")
-        except Exception as e:
-            self.is_loading_models = False
-            logger.exception("Lỗi nạp model AI")
-            self.status_update.emit(f"❌ Lỗi nạp model: {e}")
-            return
-
-        pending_prefix = ""
-        pending_stt_ms = 0.0
-        pending_since = 0.0
-
-        while self.running:
-            try:
-                audio_np = self.sentence_queue.get(timeout=0.2)
-            except queue.Empty:
-                if pending_prefix:
-                    vad_active = bool(self.is_vad_speaking_fn and self.is_vad_speaking_fn())
-                    wait_limit = 6.2 if vad_active else 1.5
-                    if (time.perf_counter() - pending_since) >= wait_limit:
-                        clean_prefix = " ".join(re.findall(r"[a-zA-Z']+", pending_prefix.lower()))
-                        # Nếu người nói đã ngừng hẳn mà mảnh chờ chỉ là liên từ trơ trọi ("And...", "But..."),
-                        # hủy mảnh cụt thay vì dịch chữ "Và..." đứng một mình gây rác màn hình
-                        if clean_prefix and all(
-                            t in (_BARE_CONJUNCTIONS | _PURE_FILLERS) for t in clean_prefix.split()
-                        ):
-                            logger.info(f"[Chiều Nghe] Bỏ qua liên từ bỏ lửng quá hạn: {pending_prefix}")
-                            self.status_update.emit("✅ Đang lắng nghe âm thanh hệ thống...")
-                            pending_prefix = ""
-                            pending_stt_ms = 0.0
-                            continue
-                        try:
-                            self.source_ready.emit(pending_prefix)
-                            vi_text, trans_ms = self.engine.translate_to_vietnamese(pending_prefix)
-                            self.mode_synced.emit(self.engine.translation_mode)
-                            logger.info(
-                                f"[Chiều Nghe] STT ({pending_stt_ms:.0f}ms): {pending_prefix} => VI ({trans_ms:.0f}ms): {vi_text}"
-                            )
-                            self.result_ready.emit(pending_prefix, vi_text, pending_stt_ms, trans_ms)
-                        except Exception:
-                            logger.exception("Lỗi dịch đoạn chờ")
-                        finally:
-                            pending_prefix = ""
-                            pending_stt_ms = 0.0
-                continue
-
-            dropped_stale = False
-            while self.sentence_queue.qsize() > 2:
-                try:
-                    audio_np = self.sentence_queue.get_nowait()
-                    dropped_stale = True
-                except queue.Empty:
-                    break
-            if dropped_stale:
-                pending_prefix = ""
-                pending_stt_ms = 0.0
-
-            try:
-                dur = len(audio_np) / 16000.0
-                self.status_update.emit(f"⚡ Đang nhận diện & dịch câu vừa nghe ({dur:.1f}s)...")
-                src_text, stt_ms = self.engine.transcribe(audio_np)
-                if len(src_text.strip()) < 2:
-                    self.status_update.emit("✅ Đang lắng nghe âm thanh hệ thống... (Đã lọc bỏ tạp âm/khoảng lặng)")
-                    continue
-                if self._is_pure_filler(src_text, self.engine.source_lang):
-                    self.status_update.emit("✅ Đang lắng nghe âm thanh hệ thống... (Đã lọc bỏ từ đệm ngập ngừng)")
-                    continue
-
-                if pending_prefix:
-                    src_text = self._stitch_prefix(pending_prefix, src_text)
-                    stt_ms += pending_stt_ms
-                    pending_prefix = ""
-                    pending_stt_ms = 0.0
-                elif self._is_dangling_fragment(src_text, self.engine.source_lang):
-                    pending_prefix = src_text.strip()
-                    pending_stt_ms = stt_ms
-                    pending_since = time.perf_counter()
-                    self.status_update.emit(f"⏳ Đang nối vế mở đầu (\"{pending_prefix}\") với câu tiếp theo...")
-                    continue
-
-                self.source_ready.emit(src_text)
-                vi_text, trans_ms = self.engine.translate_to_vietnamese(src_text)
-                self.mode_synced.emit(self.engine.translation_mode)
-                logger.info(f"[Chiều Nghe] STT ({stt_ms:.0f}ms): {src_text} => VI ({trans_ms:.0f}ms): {vi_text}")
-                self.result_ready.emit(src_text, vi_text, stt_ms, trans_ms)
-            except Exception as e:
-                logger.exception("Lỗi suy luận chiều nghe")
-                self.status_update.emit(f"⚠️ Lỗi xử lý chiều nghe: {e}")
-
-    def stop(self):
-        self.running = False
-
-
-class MeetingTranscriptLogger:
-    """
-    Tự động lưu biên bản cuộc họp song ngữ theo thời gian thực (meeting_logs/meeting_YYYY-MM-DD_HH-MM-SS.md)
-    để người dùng rà soát lại mọi con số, cam kết và nội dung hai chiều sau buổi họp.
-    """
-    def __init__(self, logs_dir: str = MEETING_LOGS_DIR):
-        self.logs_dir = logs_dir
-        self.enabled = True
-        self._lock = threading.Lock()
-        self._session_file: str | None = None
-
-    def _ensure_file(self) -> str:
-        if self._session_file is None:
-            os.makedirs(self.logs_dir, exist_ok=True)
-            ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            self._session_file = os.path.join(self.logs_dir, f"meeting_{ts}.md")
-            header = (
-                f"# Biên bản Họp Song ngữ — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                f"> Tự động ghi bởi **Local AI 2-Way Live Translator** (100% Local STT/LLM).\n\n---\n\n"
-            )
-            with open(self._session_file, "w", encoding="utf-8") as f:
-                f.write(header)
-        return self._session_file
-
-    def log_incoming(self, src_text: str, vi_text: str, lang: str = "en"):
-        if not self.enabled or not src_text:
-            return
-        with self._lock:
-            try:
-                path = self._ensure_file()
-                now_str = datetime.datetime.now().strftime("%H:%M:%S")
-                entry = (
-                    f"- **[{now_str}] 👥 Đối tác (`{lang}`):** {src_text}  \n"
-                    f"  ➔ **VI:** {vi_text}\n\n"
-                )
-                with open(path, "a", encoding="utf-8") as f:
-                    f.write(entry)
-            except Exception as e:
-                logger.warning(f"Không thể ghi biên bản chiều nghe: {e}")
-
-    def log_outgoing(self, vi_said: str, en_spoken: str):
-        if not self.enabled or not vi_said:
-            return
-        with self._lock:
-            try:
-                path = self._ensure_file()
-                now_str = datetime.datetime.now().strftime("%H:%M:%S")
-                entry = (
-                    f"- **[{now_str}] 🎙️ Bạn phát biểu (`vi`):** {vi_said}  \n"
-                    f"  ➔ **🔊 Phát sang Meet (`en`):** {en_spoken}\n\n"
-                )
-                with open(path, "a", encoding="utf-8") as f:
-                    f.write(entry)
-            except Exception as e:
-                logger.warning(f"Không thể ghi biên bản chiều nói: {e}")
-
-    def open_in_explorer(self):
-        os.makedirs(self.logs_dir, exist_ok=True)
-        target = self._session_file if (self._session_file and os.path.isfile(self._session_file)) else self.logs_dir
-        try:
-            if platform.system() == "Windows":
-                os.startfile(target)
-            elif platform.system() == "Darwin":
-                subprocess.Popen(["open", target])
-            else:
-                subprocess.Popen(["xdg-open", target])
-        except Exception as e:
-            logger.warning(f"Không thể mở thư mục biên bản họp: {e}")
+logger = setup_logging()
 
 
 class OutgoingVoiceWorker(QThread):
@@ -376,6 +138,8 @@ class OutgoingVoiceWorker(QThread):
 class ControlBar(QWidget):
     ptt_state_signal = pyqtSignal(str)
     hud_state_signal = pyqtSignal(str)
+    bridge_event_signal = pyqtSignal(str, str, str)
+    bridge_config_signal = pyqtSignal(dict)
 
     def __init__(self):
         super().__init__()
@@ -402,12 +166,18 @@ class ControlBar(QWidget):
 
         self.audio_worker = None
         self.incoming_ai_worker = None
+        self.summary_worker: SummaryWorker | None = None
+
+        self.summary_settings = SummarySettings.load(SUMMARY_SETTINGS_PATH)
 
         self.overlay = SubtitleOverlayWindow()
         self.overlay.show()
+        self.summary_panel = SummaryPanelWindow(max_points_shown=self.summary_settings.max_points_shown)
 
         self.ptt_state_signal.connect(self._on_ptt_status)
         self.hud_state_signal.connect(self._on_hud_status)
+        self.bridge_event_signal.connect(self._on_bridge_event)
+        self.bridge_config_signal.connect(self._on_bridge_config_updated)
 
         # Khởi chạy sẵn luồng đợi Chiều Nói và bộ thu Push-To-Talk
         self.ptt_recorder = MicPushToTalkRecorder(
@@ -424,6 +194,16 @@ class ControlBar(QWidget):
         self._build_ui()
         self.position_at_top_center()
         self._start_global_hotkey_listener()
+
+        # Khởi chạy BrowserBridgeServer ở chế độ Integrated (dùng chung 100% VRAM với Desktop)
+        self.bridge_server = BrowserBridgeServer(
+            engine=self.engine,
+            mode="integrated",
+            on_session_started=lambda sid, title: self.bridge_event_signal.emit("started", sid, title),
+            on_session_stopped=lambda sid, reason: self.bridge_event_signal.emit("stopped", sid, reason),
+            on_config_updated=lambda cfg: self.bridge_config_signal.emit(cfg),
+        )
+        self.bridge_server.start(wait_ready=False)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -480,7 +260,7 @@ class ControlBar(QWidget):
     def _build_ui(self):
         self.setWindowTitle("Local AI 2-Way Live Translator - Control Panel")
         self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
-        self.resize(1060, 255)
+        self.resize(1060, 290)
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(10, 8, 10, 8)
@@ -553,7 +333,7 @@ class ControlBar(QWidget):
         row_display.addWidget(self.chk_compact_vi)
 
         self.chk_click = QCheckBox("Click xuyên phụ đề")
-        self.chk_click.toggled.connect(self.overlay.set_click_through)
+        self.chk_click.toggled.connect(self.on_click_through_toggled)
         row_display.addWidget(self.chk_click)
 
         self.chk_stealth = QCheckBox("🔒 Ẩn khi Share màn hình")
@@ -567,7 +347,52 @@ class ControlBar(QWidget):
         self.chk_stealth.toggled.connect(self.on_stealth_toggled)
         row_display.addWidget(self.chk_stealth)
         row_display.addStretch(1)
+
+        self.chrome_status_label = QLabel("🌐 Chrome: Chưa kết nối")
+        self.chrome_status_label.setStyleSheet("color: #0284c7; font-size: 12px; font-weight: bold;")
+        row_display.addWidget(self.chrome_status_label)
         main_layout.addLayout(row_display)
+
+        # Hàng 1c: Tầng 2 — "🧭 Ý chính đang bàn" (Chế độ Phiên dịch viên Cabin, đổi nóng khi đang chạy)
+        row_summary = QHBoxLayout()
+        row_summary.setSpacing(10)
+        summary_lbl = QLabel("🧭 Ý chính:")
+        summary_lbl.setStyleSheet("color: #0f172a; font-weight: bold;")
+        row_summary.addWidget(summary_lbl)
+
+        self.summary_mode_combo = QComboBox()
+        self.summary_mode_combo.addItem("Tắt", "off")
+        self.summary_mode_combo.addItem("⏱ Theo chu kỳ", "interval")
+        self.summary_mode_combo.addItem("⏸ Theo nhịp nghỉ", "pause")
+        self.summary_mode_combo.setMaximumWidth(165)
+        self.summary_mode_combo.currentIndexChanged.connect(self.on_summary_mode_changed)
+        row_summary.addWidget(self.summary_mode_combo)
+
+        self.summary_param_label = QLabel("Mỗi (giây):")
+        row_summary.addWidget(self.summary_param_label)
+
+        self.summary_param_spin = QDoubleSpinBox()
+        self.summary_param_spin.setMaximumWidth(80)
+        self.summary_param_spin.valueChanged.connect(self.on_summary_param_changed)
+        row_summary.addWidget(self.summary_param_spin)
+
+        row_summary.addWidget(QLabel("Tối thiểu câu:"))
+        self.summary_min_sent_spin = QSpinBox()
+        self.summary_min_sent_spin.setRange(1, 8)
+        self.summary_min_sent_spin.setValue(self.summary_settings.min_new_sentences)
+        self.summary_min_sent_spin.setMaximumWidth(65)
+        self.summary_min_sent_spin.valueChanged.connect(self.on_summary_min_sent_changed)
+        row_summary.addWidget(self.summary_min_sent_spin)
+
+        self.btn_summary_now = QPushButton("🔄 Tổng hợp ngay")
+        self.btn_summary_now.setToolTip("Tổng hợp ngay các câu mới đang chờ (dùng để kiểm thử nhanh)")
+        self.btn_summary_now.setStyleSheet("font-weight: bold; padding: 3px 10px;")
+        self.btn_summary_now.clicked.connect(self.on_summary_now_clicked)
+        row_summary.addWidget(self.btn_summary_now)
+        row_summary.addStretch(1)
+        main_layout.addLayout(row_summary)
+
+        self._sync_summary_controls_from_settings()
 
         # Hàng 2: Điều khiển Chiều Nói (Outgoing Virtual Mic, Duyệt nhanh 1.5s & Hủy khẩn cấp Esc)
         row2 = QHBoxLayout()
@@ -684,9 +509,14 @@ class ControlBar(QWidget):
         self.kb_listener.daemon = True
         self.kb_listener.start()
 
+    def on_click_through_toggled(self, checked: bool):
+        self.overlay.set_click_through(checked)
+        self.summary_panel.set_click_through(checked)
+
     def on_stealth_toggled(self, checked: bool):
         self._hide_from_capture = checked
         ok_overlay = self.overlay.set_hide_from_capture(checked)
+        self.summary_panel.set_hide_from_capture(checked)
         ok_panel = apply_window_capture_stealth(self, checked)
         if checked:
             if ok_overlay and ok_panel:
@@ -695,6 +525,99 @@ class ControlBar(QWidget):
                 self._on_hud_status("⚠️ Windows hiện tại không hỗ trợ ẩn cửa sổ khỏi trình quay màn hình.")
         else:
             self._on_hud_status("👁️ Đã TẮT ẩn khi Share màn hình (Người xem Share màn hình sẽ thấy phụ đề).")
+
+    def _sync_summary_controls_from_settings(self):
+        mode = self.summary_settings.mode
+        idx = self.summary_mode_combo.findData(mode)
+        if idx < 0:
+            idx = 1
+        self.summary_mode_combo.blockSignals(True)
+        self.summary_mode_combo.setCurrentIndex(idx)
+        self.summary_mode_combo.blockSignals(False)
+
+        self.summary_param_spin.blockSignals(True)
+        if mode == "pause":
+            self.summary_param_label.setText("Im lặng (giây):")
+            self.summary_param_spin.setDecimals(1)
+            self.summary_param_spin.setSingleStep(0.5)
+            self.summary_param_spin.setRange(1.0, 5.0)
+            self.summary_param_spin.setValue(self.summary_settings.pause_sec)
+            self.summary_param_spin.setEnabled(True)
+            self.summary_min_sent_spin.setEnabled(True)
+        elif mode == "interval":
+            self.summary_param_label.setText("Mỗi (giây):")
+            self.summary_param_spin.setDecimals(0)
+            self.summary_param_spin.setSingleStep(5.0)
+            self.summary_param_spin.setRange(15.0, 90.0)
+            self.summary_param_spin.setValue(self.summary_settings.interval_sec)
+            self.summary_param_spin.setEnabled(True)
+            self.summary_min_sent_spin.setEnabled(True)
+        else:
+            self.summary_param_label.setText("Mỗi (giây):")
+            self.summary_param_spin.setDecimals(0)
+            self.summary_param_spin.setSingleStep(5.0)
+            self.summary_param_spin.setRange(15.0, 90.0)
+            self.summary_param_spin.setValue(self.summary_settings.interval_sec)
+            self.summary_param_spin.setEnabled(False)
+            self.summary_min_sent_spin.setEnabled(False)
+        self.summary_param_spin.blockSignals(False)
+
+        self.summary_min_sent_spin.blockSignals(True)
+        self.summary_min_sent_spin.setValue(self.summary_settings.min_new_sentences)
+        self.summary_min_sent_spin.blockSignals(False)
+
+        if mode == "off":
+            self.summary_panel.hide()
+        elif self.audio_worker and self.audio_worker.running:
+            self.summary_panel.show()
+
+    def _propagate_summary_settings(self):
+        self.summary_settings.save(SUMMARY_SETTINGS_PATH)
+        d = self.summary_settings.to_dict()
+        if self.summary_worker and self.summary_worker.isRunning():
+            self.summary_worker.apply_settings(d)
+        if hasattr(self, "bridge_server") and self.bridge_server and hasattr(self.bridge_server, "apply_summary_settings"):
+            self.bridge_server.apply_summary_settings(d)
+
+    def on_summary_mode_changed(self, idx: int):
+        new_mode = str(self.summary_mode_combo.currentData() or "interval")
+        self.summary_settings.update_from_dict({"mode": new_mode})
+        self._sync_summary_controls_from_settings()
+        self._propagate_summary_settings()
+
+    def on_summary_param_changed(self, val: float):
+        mode = self.summary_settings.mode
+        if mode == "pause":
+            self.summary_settings.update_from_dict({"pause_sec": float(val)})
+        else:
+            self.summary_settings.update_from_dict({"interval_sec": float(val)})
+        self._propagate_summary_settings()
+
+    def on_summary_min_sent_changed(self, val: int):
+        self.summary_settings.update_from_dict({"min_new_sentences": int(val)})
+        self._propagate_summary_settings()
+
+    def on_summary_now_clicked(self):
+        if self.summary_worker and self.summary_worker.isRunning():
+            self.summary_worker.request_now()
+            self._on_hud_status("🔄 Đã yêu cầu tổng hợp ý chính ngay lập tức...")
+        elif hasattr(self, "bridge_server") and self.bridge_server and getattr(self.bridge_server, "active_session", None):
+            sess = self.bridge_server.active_session
+            if getattr(sess, "summary_worker", None):
+                sess.summary_worker.request_now()
+                self._on_hud_status("🔄 Đã yêu cầu tổng hợp ý chính ngay trên phiên Chrome...")
+        else:
+            self._on_hud_status("ℹ️ Hãy bật Dịch Chiều Nghe (hoặc dịch tab Chrome) trước khi bấm Tổng hợp ngay.")
+
+    def _stop_summary_worker(self):
+        if self.summary_worker is not None:
+            try:
+                self.summary_worker.stop()
+                self.summary_worker.wait(3000)
+            except Exception:
+                pass
+            self.summary_worker = None
+        self.summary_panel.hide()
 
     def on_preview_toggled(self, checked: bool):
         self.outgoing_worker.preview_before_speak = checked
@@ -755,28 +678,129 @@ class ControlBar(QWidget):
     def on_tts_mode_changed(self, idx: int):
         self.tts_router.tts_engine_mode = "neural_edge" if idx == 0 else "offline_native"
 
+    def _on_bridge_event(self, evt_type: str, session_id: str, detail: str):
+        """Xử lý sự kiện từ BrowserBridgeServer trên luồng Qt GUI chính (an toàn đa luồng)."""
+        if evt_type == "started":
+            short_title = detail if len(detail) <= 36 else f"{detail[:33]}..."
+            self.chrome_status_label.setText(f"🌐 Chrome: Đang dịch '{short_title}'")
+            self.chrome_status_label.setStyleSheet("color: #16a34a; font-size: 12px; font-weight: bold;")
+            self.chrome_status_label.setToolTip(f"Phiên Chrome ({session_id}): {detail}")
+
+            # Độc quyền nguồn Chiều Nghe: tự dừng WASAPI Loopback nếu đang chạy
+            if self.audio_worker and self.audio_worker.running:
+                logger.info(
+                    f"[Bridge] Phiên Chrome '{detail}' bắt đầu -> Tự động tạm dừng Chiều Nghe loa hệ thống."
+                )
+                self.audio_worker.stop()
+                if self.incoming_ai_worker:
+                    self.incoming_ai_worker.stop()
+                self._stop_summary_worker()
+                self.btn_toggle.setText("▶ Bật Dịch Chiều Nghe")
+                self._on_hud_status(
+                    f"🌐 Chrome đang dịch tab: {detail}. Đã tạm dừng Chiều Nghe loa hệ thống."
+                )
+            else:
+                self._on_hud_status(f"🌐 Chrome đang dịch tab: {detail}")
+
+        elif evt_type == "stopped":
+            self.chrome_status_label.setText("🌐 Chrome: Chưa kết nối")
+            self.chrome_status_label.setStyleSheet("color: #0284c7; font-size: 12px; font-weight: bold;")
+            self.chrome_status_label.setToolTip("")
+            if detail != "desktop_takeover" and not (self.audio_worker and self.audio_worker.running):
+                self._on_hud_status("🌐 Đã kết thúc phiên dịch trên tab Chrome.")
+
+    def _on_bridge_config_updated(self, cfg: dict):
+        """Đồng bộ lại các điều khiển trên ControlBar khi người dùng đổi cấu hình từ Chrome Extension."""
+        if not cfg:
+            return
+        if "source_lang" in cfg:
+            lang = cfg["source_lang"]
+            for i in range(self.lang_combo.count()):
+                if self.lang_combo.itemText(i).startswith(f"{lang} "):
+                    self.lang_combo.blockSignals(True)
+                    self.lang_combo.setCurrentIndex(i)
+                    self.lang_combo.blockSignals(False)
+                    break
+        if "translation_mode" in cfg:
+            self._on_worker_mode_synced(cfg["translation_mode"])
+        if "glossary" in cfg and cfg["glossary"] is not None:
+            new_gloss = str(cfg["glossary"]).strip()
+            if self.glossary_input.text().strip() != new_gloss:
+                self.glossary_input.blockSignals(True)
+                self.glossary_input.setText(new_gloss)
+                self.glossary_input.blockSignals(False)
+        if any(
+            k in cfg
+            for k in (
+                "summary_mode",
+                "summary_interval_sec",
+                "summary_pause_sec",
+                "summary_min_new_sentences",
+                "mode",
+                "interval_sec",
+                "pause_sec",
+                "min_new_sentences",
+            )
+        ):
+            if self.summary_settings.update_from_dict(cfg):
+                self._sync_summary_controls_from_settings()
+                if self.summary_worker and self.summary_worker.isRunning():
+                    self.summary_worker.apply_settings(self.summary_settings.to_dict())
+
     def toggle_capture(self):
         if self.audio_worker and self.audio_worker.running:
             logger.info("Người dùng bấm dừng chiều nghe.")
             self.audio_worker.stop()
             if self.incoming_ai_worker:
                 self.incoming_ai_worker.stop()
+            self._stop_summary_worker()
             self.btn_toggle.setText("▶ Bật Dịch Chiều Nghe")
             self._on_hud_status("Đã tạm dừng chiều nghe. (Chiều nói F8 vẫn hoạt động)")
         else:
             logger.info("Người dùng bấm bật chiều nghe.")
+            # Độc quyền nguồn Chiều Nghe: nếu đang có phiên tab Chrome thì dừng phiên tab trước
+            if hasattr(self, "bridge_server") and self.bridge_server:
+                self.bridge_server.stop_active_session(reason="desktop_takeover")
+            self._stop_summary_worker()
             self.engine.reset_context()
             self.overlay.reset_subtitles()
             self.btn_toggle.setText("⏹ Dừng Chiều Nghe")
+            vad_speaking_fn = lambda: bool(self.audio_worker and self.audio_worker.is_capturing_speech)
             self.incoming_ai_worker = IncomingInferenceWorker(
                 self.incoming_queue,
                 self.engine,
-                is_vad_speaking_fn=lambda: bool(self.audio_worker and self.audio_worker.is_capturing_speech),
+                is_vad_speaking_fn=vad_speaking_fn,
             )
             self.incoming_ai_worker.result_ready.connect(self._on_incoming_completed)
             self.incoming_ai_worker.source_ready.connect(self.overlay.show_incoming_source)
             self.incoming_ai_worker.status_update.connect(self._on_hud_status)
             self.incoming_ai_worker.mode_synced.connect(self._on_worker_mode_synced)
+
+            self.summary_worker = SummaryWorker(
+                engine=self.engine,
+                settings=SummarySettings.from_dict(self.summary_settings.to_dict())
+                if hasattr(SummarySettings, "from_dict")
+                else SummarySettings(**self.summary_settings.to_dict()),
+                is_vad_speaking_fn=vad_speaking_fn,
+                is_pipeline_idle_fn=self.incoming_ai_worker.is_idle,
+                source="desktop",
+                enable_telemetry=True,
+                metrics_dir=MEETING_LOGS_DIR,
+            )
+            self.incoming_ai_worker.result_ready.connect(
+                lambda src, vi, _stt, _trans: self.summary_worker.add_sentence(src, vi)
+                if self.summary_worker
+                else None
+            )
+            self.summary_worker.summary_ready.connect(self.summary_panel.update_summary)
+            self.summary_worker.summary_ready.connect(self.transcript_logger.log_summary)
+            self.summary_worker.status_update.connect(self.summary_panel.set_status)
+            self.summary_panel.reset()
+            if self.summary_settings.mode != "off":
+                self.summary_panel.show()
+            else:
+                self.summary_panel.hide()
+            self.summary_worker.start()
             self.incoming_ai_worker.start()
 
             self.audio_worker = SystemAudioVADWorker(
@@ -793,12 +817,19 @@ class ControlBar(QWidget):
                 self.kb_listener.stop()
             except Exception:
                 pass
+        if hasattr(self, "bridge_server") and self.bridge_server:
+            try:
+                self.bridge_server.stop()
+            except Exception:
+                pass
         if self.audio_worker:
             self.audio_worker.stop()
         if self.incoming_ai_worker:
             self.incoming_ai_worker.stop()
+        self._stop_summary_worker()
         if self.outgoing_worker:
             self.outgoing_worker.stop()
+        self.summary_panel.close()
         self.overlay.close()
         event.accept()
 

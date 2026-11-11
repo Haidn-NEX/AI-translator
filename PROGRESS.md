@@ -134,23 +134,68 @@
          - Nâng cấp `SubtitleOverlayWindow` với **Bộ điều tốc nhịp đọc bất đồng bộ (`_pacer_timer` + `_display_queue`)**: đảm bảo mỗi câu hiển thị trên dòng vàng chính tối thiểu `1.45s - 3.1s` (tỷ lệ theo số từ, tự động nén nhịp bắt kịp khi hàng đợi `>= 1-2` câu) trước khi cuộn mượt lên dòng lịch sử `prev_vi_label` (`⤴ `); chỉ gộp tại chỗ các mảnh câu thực sự nối tiếp ngữ pháp (`_should_merge_with_current`) và tự động co giãn chiều cao theo `totalHeightForWidth(980)` (neo cố định cạnh đáy, ẩn `prev_vi_label` khi trống).
          - Tách riêng thanh tùy chọn `🖥️ Hiển thị phụ đề:` (`👁️ Chỉ hiện Tiếng Việt (Đọc nhanh)`, `Click xuyên phụ đề`, `🔒 Ẩn khi Share màn hình`) trên `ControlBar` để chống tràn ngang trên màn hình laptop DPI 125%.
 
+### 2.4. Tiến độ Triển khai Chrome Extension "Dịch Video Tại Chỗ" (Theo [`docs/CHROME_EXTENSION_SPEC.md`](./docs/CHROME_EXTENSION_SPEC.md))
+
+| Giai đoạn | Hạng mục | Trạng thái | Ghi chú nghiệm thu |
+| :--- | :--- | :--- | :--- |
+| **P0 — Refactor** | Tách [`incoming_pipeline.py`](./incoming_pipeline.py) (`IncomingInferenceWorker`, `MeetingTranscriptLogger`, `setup_logging()`, hằng số từ đệm/liên từ) và import lại vào [`main.py`](./main.py) | ✅ **Hoàn thành (Done)** | `py_compile` sạch 100%, kiểm thử `IncomingInferenceWorker` & `MeetingTranscriptLogger` (cả chế độ `meeting` và `video`) hoạt động nguyên vẹn, không đổi hành vi app desktop. |
+| **P1 — Backend bridge** | [`browser_bridge.py`](./browser_bridge.py), [`bridge_server.py`](./bridge_server.py), [`tests/test_bridge_ws.py`](./tests/test_bridge_ws.py) | ✅ **Hoàn thành (Done)** | Đạt 100% tiêu chí nghiệm thu: `_StreamingResampler` chuẩn cho `16kHz/44.1kHz/48kHz`, chặn bind `0.0.0.0`, `/health` trả đúng JSON, token sai / Origin lạ trả `403`, stream 61s WAV 48kHz thời gian thực qua WS nhận 12 sự kiện `source` và 11 sự kiện `result` tiếng Việt chuẩn xác, tự ghi `meeting_logs/video_*.md`. |
+| **P2 — Extension MVP** | `chrome_extension/*` ([`manifest.json`](./chrome_extension/manifest.json), [`service_worker.js`](./chrome_extension/service_worker.js), [`offscreen.js`](./chrome_extension/offscreen.js), [`pcm_worklet.js`](./chrome_extension/pcm_worklet.js), [`content_script.js`](./chrome_extension/content_script.js), [`overlay.css`](./chrome_extension/overlay.css), [`popup.html`](./chrome_extension/popup.html), [`options.html`](./chrome_extension/options.html)), [`start_bridge.bat`](./start_bridge.bat) | ✅ **Hoàn thành (Done)** | Hoàn thiện toàn bộ khung MV3: `tabCapture` giữ nguyên tiếng video (`source.connect(audioCtx.destination)`), `AudioWorklet` gom khung `40ms Int16 mono`, tự đồng bộ token từ origin `chrome-extension://`, Shadow DOM overlay cô lập CSS bám theo thẻ `<video>` + hỗ trợ Fullscreen, Popup & Options 100% tiếng Việt, kèm `start_bridge.bat`. |
+| **P3 — Native launcher** | [`native_host/launcher.py`](./native_host/launcher.py), [`native_host/launcher.bat`](./native_host/launcher.bat), [`native_host/com.local_translator.bridge.json.template`](./native_host/com.local_translator.bridge.json.template), [`native_host/install_native_host.ps1`](./native_host/install_native_host.ps1) | ✅ **Hoàn thành (Done)** | Đã cài đặt manifest + Registry HKCU (`Chrome`/`Edge`/`Brave`) + Scheduled Task `LocalTranslatorBridge`; kiểm thử thực tế giao thức nhị phân stdio 4-byte LE (`get_token` & `ensure_running` phản hồi `< 300ms`), tiến trình `pythonw.exe bridge_server.py` sống sót 100% sau khi `launcher.bat` thoát và tự động tắt giải phóng VRAM khi hết thời gian `idle-exit`. |
+| **P4 — UX hoàn chỉnh** | [`chrome_extension/subtitle_pacer.js`](./chrome_extension/subtitle_pacer.js), [`tests/test_subtitle_pacer.html`](./tests/test_subtitle_pacer.html), nâng cấp [`chrome_extension/content_script.js`](./chrome_extension/content_script.js), tích hợp Integrated mode vào [`main.py`](./main.py) | ✅ **Hoàn thành (Done)** | Port chính xác 100% bộ điều nhịp đọc `SubtitlePacer` từ `overlay_ui.py` (4 nhánh: hiển thị ngay / gộp tại chỗ câu nối tiếp ngữ pháp / hàng đợi chống trễ `> 2` / cuộn mượt `⤴`), hỗ trợ kéo thả lưu offset theo từng trang (`dragOffset:<hostname>`), xử lý YouTube SPA (`yt-navigate-finish`) & làm mờ khi pause `> 5s`, tích hợp `BrowserBridgeServer` vào `ControlBar` kèm cơ chế độc quyền nguồn Chiều Nghe và đồng bộ 2 chiều combo/glossary qua `pyqtSignal`. |
+| **P5 — Tài liệu** | Cập nhật bộ tài liệu Harness ([`CLAUDE.md`](./CLAUDE.md), [`AGENTS.md`](./AGENTS.md), [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`README.md`](./README.md), [`docs/EXTENSION_GUIDE.md`](./docs/EXTENSION_GUIDE.md), [`PROGRESS.md`](./PROGRESS.md)) | ✅ **Hoàn thành (Done)** | Đã cập nhật đồng bộ toàn bộ sơ đồ kiến trúc 3 luồng (Desktop Incoming, Chrome Tab Bridge, Outgoing PTT), bảng mô-đun, mô hình 8 luồng thực thi, hướng dẫn cài đặt Native Host + phím tắt `Alt+Shift+T`, và Playbook mở rộng nguồn âm thanh `TabAudioVADWorker`. |
+
+### 2.5. Tiến độ Triển khai Tầng 2 "🧭 Ý chính đang bàn" (Theo [`docs/INTERPRETER_SUMMARY_SPEC.md`](./docs/INTERPRETER_SUMMARY_SPEC.md))
+
+- **Đặc tả triển khai:** [`docs/INTERPRETER_SUMMARY_SPEC.md`](./docs/INTERPRETER_SUMMARY_SPEC.md). Có 2 chế độ kích hoạt `⏱ Theo chu kỳ` / `⏸ Theo nhịp nghỉ`, chỉnh nóng khi đang chạy để người dùng test thực tế rồi chốt chế độ mặc định.
+- **Kết quả Benchmark `num_ctx` (`tests/bench_ollama_ctx.py` trên GTX 1070 Vulkan + `qwen2.5:3b`):**
+  - `num_ctx = 512`: Dịch p50 = `945 ms`, p95 = `1556 ms` (baseline), VRAM = `3626 MiB`.
+  - **`num_ctx = 1024` (Đã chọn):** Dịch p50 = `981 ms`, p95 = `1304 ms` (`-16.2%` vs 512, thỏa mãn `≤ +15%`), VRAM = `3597 MiB`, Summary `prompt_ms = 1017 ms`, `total_ms = 3036 ms`, `ok = True`.
+  - `num_ctx = 2048`: Dịch p50 = `974 ms`, p95 = `1303 ms` (`-16.3%` vs 512), VRAM = `3631 MiB`, Summary `prompt_ms = 1015 ms`, `total_ms = 2909 ms`, `ok = True`.
+- **Kết quả Test Preempt ở `OLLAMA_NUM_CTX = 1024` (Dịch gọi sau `300 ms` khi đang chạy Tóm tắt):**
+  - Ở các lượt kết nối ổn định (#2–#5), luồng tóm tắt bị ngắt và thoát ngay ở `312–317 ms` (`12–17 ms` sau thời điểm `300 ms`), độ trễ dịch tăng thêm từ `-97 ms` đến `+156 ms` (**p50 = `+64 ms`**).
+  - Ở lượt #1 (ngay sau khi chuyển đổi prompt/model làm miss KV prefix cache, Ollama đang chạy batch prompt-eval không ngắt giữa chừng trên GPU và `urllib3` tạo lại kết nối qua `_new_conn`), summary thoát ở `1017 ms` làm lượt #1 tăng `+571 ms` (kéo p95 của 5 mẫu lên `+488 ms`). Đã bổ sung hook cả `pool._new_conn` trong `_create_summary_session()` để luôn đóng trúng socket ngay cả khi `urllib3` tạo kết nối mới.
+
+| Giai đoạn | Hạng mục | Trạng thái | Ghi chú nghiệm thu |
+| :--- | :--- | :--- | :--- |
+| **P0 — Nền tảng LLM & Benchmark** | `OLLAMA_NUM_CTX = 1024`, `_llm_lock` / `_llm_preempt`, `generate_summary_json()` trong [`ai_engine.py`](./ai_engine.py) + [`tests/bench_ollama_ctx.py`](./tests/bench_ollama_ctx.py) | ✅ **Hoàn thành (Done)** | Đã chốt `OLLAMA_NUM_CTX = 1024` (VRAM ~3.6 GB, p95 dịch `1304 ms`), preempt p50 = `+64 ms` (lượt #2–#5 thoát sau `12–17 ms`, lượt đầu cold prompt-eval `+571 ms`), `py_compile` sạch 100%. |
+| **P1 — Lõi & Unit test** | [`interpreter_summary.py`](./interpreter_summary.py), [`tests/test_summary_worker.py`](./tests/test_summary_worker.py), [`.gitignore`](./.gitignore) | ✅ **Hoàn thành (Done)** | Hoàn thiện `SummarySettings`, `decide_trigger`, `build_summary_prompt`, `validate_summary`, `SummaryWorker(QThread)` (hết hạn câu hỏi 90s, tự tạm dừng khi không có Ollama, retry khi bị preempt); toàn bộ 6 unit test trong `tests.test_summary_worker` đạt 100% (`0.105s`). |
+| **P2 — Tích hợp Desktop** | [`incoming_pipeline.py`](./incoming_pipeline.py), [`overlay_ui.py`](./overlay_ui.py) (`SummaryPanelWindow`), [`main.py`](./main.py) (`ControlBar`) | ✅ **Hoàn thành (Done)** | Bổ sung `SummaryPanelWindow` tách biệt ở góc phải phía trên `SubtitleOverlayWindow` (`Intersects: False`), hỗ trợ stealth `WDA_EXCLUDEFROMCAPTURE` & click-through, hàng điều khiển `🧭 Ý chính:` đổi nóng (`Tắt` / `⏱ Theo chu kỳ` / `⏸ Theo nhịp nghỉ` + `🔄 Tổng hợp ngay`), và ghi mục `### 🧭 Tóm tắt ý chính` vào biên bản họp. |
+| **P3 — Bridge & Chrome Extension** | [`browser_bridge.py`](./browser_bridge.py), `chrome_extension/*`, [`tests/test_bridge_summary.py`](./tests/test_bridge_summary.py) | ✅ **Hoàn thành (Done)** | Đồng bộ `summary_settings` trong `hello_ack`/`start`/`config`, xử lý `summary_now`, phát sự kiện `summary` & `summary_status` qua WS; hiển thị thẻ `.lat-summary-card` ở góc trên-phải `<video>` trong cùng Shadow DOM (hỗ trợ Fullscreen & nút thu gọn `–`); unit test `tests.test_bridge_summary` đạt 100%. |
+| **P4 — Telemetry & Tài liệu** | CSV telemetry (`meeting_logs/summary_metrics_*.csv`), [`tests/summarize_metrics.py`](./tests/summarize_metrics.py), cập nhật tài liệu Harness | ✅ **Hoàn thành (Done)** | Đã tích hợp ghi CSV telemetry UTF-8-BOM trong `SummaryWorker`, log `(preempted_summary)` / `dropped_stale` trong `IncomingInferenceWorker`, công cụ `tests/summarize_metrics.py`, và cập nhật đồng bộ `README.md`, `ARCHITECTURE.md`, `docs/CHROME_EXTENSION_SPEC.md`, `docs/EXTENSION_GUIDE.md`, `AGENTS.md`, `CLAUDE.md`, `PROGRESS.md`. |
+
+### 2.6. Tiến độ Triển khai Chế độ Phụ đề Gốc YouTube (Hybrid YouTube Caption Mode — `0 ms` độ trễ hiển thị)
+
+- **Mục tiêu:** Khi xem video YouTube (VOD / Shorts), tự động bắt luồng phụ đề gốc của video (`/api/timedtext` định dạng `json3`/`srv3`/`vtt`) thay vì phải chạy Whisper STT trên âm thanh tab, đưa câu hoàn chỉnh kèm ngữ cảnh 2 chiều (câu trước + câu sắp nói) vào `LocalAIEngine` (`Ollama qwen2.5:3b` + tường lửa `NLLB-200 INT8`), hiển thị khớp trực tiếp theo `video.currentTime` (`0 ms` trễ cảm nhận, `0%` tải Whisper STT), và tự động rơi về Audio Mode (`tabCapture` → Whisper) khi video không có phụ đề hoặc là livestream.
+- **Các quyết định thiết kế đã triển khai:**
+  1. **Cách A — Tự nháy nạp phụ đề trên `#movie_player` khi CC đang tắt (`chrome_extension/yt_caption_hook.js`):** Bắt trực tiếp gói `/api/timedtext` do `#movie_player` phát sinh (tránh hoàn toàn lỗi rỗng `200 OK` do thiếu PO Token `&pot=`), khôi phục từ bộ đệm HTTP nếu tab đã mở sẵn trước khi nạp extension, hoặc nháy nạp track ngoại ngữ tốt nhất trong `~150–250 ms` rồi **tự động trả nút CC của YouTube về trạng thái OFF ban đầu** (không chèn CSS ẩn CC của YouTube).
+  2. **Tái tạo câu sạch không chồng lấp từ `json3` ASR & Dịch Batch Cửa sổ Trượt `+90s` (`youtube_caption.py` & `ai_engine.py`):**
+     - Ghép từ theo mốc `tStartMs + tOffsetMs` để loại bỏ hoàn toàn hiện tượng lặp 2 dòng cuộn (`wWinId` / `aAppend: 1`) của phụ đề tự động YouTube; tự gộp các mảnh câu ngắn của phụ đề thủ công.
+     - `LocalAIEngine.translate_caption_batch()` giữ nguyên bất biến `OLLAMA_NUM_CTX = 1024`: câu ngay tại playhead chạy đơn khẩn cấp (`urgent=True`, `< 1s`), còn các lô đón đầu 4 câu trong cửa sổ `+90s` chạy `urgent=False` (kèm 2 câu trước + 2 câu lookahead + `custom_glossary.txt`, không ngắt ngang `SummaryWorker`) và cứu hộ từng dòng lẻ qua `NLLB-200` nếu dính chữ Hán/echo mà không làm lệch mốc thời gian.
+     - Lưu đệm bền vững tại `caption_cache/` (tối đa 80 video LRU, tự vô hiệu hóa khi đổi `glossary` hoặc `translation_mode`).
+  3. **Chống lộ nội dung tương lai (`+90s`) vào Tóm tắt Ý chính & Biên bản (`browser_bridge.py`):** `BridgeSession._record_watched_cues_up_to()` chỉ đẩy câu vào `SummaryWorker` và `MeetingTranscriptLogger` đúng khi `video.currentTime` thực sự chạy qua câu đó (tự bỏ qua đoạn bị tua nhảy cóc). Giữ nguyên kết nối `offscreen.html` ở chế độ nghỉ (`pcmPaused = true`) để chuyển bài SPA (`yt-navigate-finish`) sang video không có phụ đề vẫn tự bật lại Whisper mượt mà không cần bấm lại `Alt+Shift+T`.
+  4. **Kiểm thử tự động:** `py_compile` + `node --check` sạch 100%; toàn bộ **13/13 unit & integration tests** (`tests.test_youtube_caption`, `tests.test_summary_worker`, `tests.test_bridge_summary`) đạt `OK`.
+
 ---
 
 ## 3. Các Bước Tiếp theo Khi Bật Lên Lại (Next Steps)
 
-Khi quay lại làm việc hoặc chuẩn bị vào cuộc họp thực tế:
+Khi quay lại làm việc, xem video học tập trên Chrome hoặc chuẩn bị vào cuộc họp thực tế:
 
-1. **Bước 1 — Khởi chạy ứng dụng (Mọi Model & Ollama Vulkan đã sẵn sàng 100% trên máy):**
+1. **Bước 1 — Khởi chạy ứng dụng Desktop (Mọi Model & Ollama Vulkan đã sẵn sàng 100% trên máy):**
    - Click đúp **`setup_and_run.bat`** *(hoặc chạy `.\venv\Scripts\python.exe main.py`)*.
-   - Toàn bộ model (`Faster-Whisper large-v3-turbo-ct2`, `Ollama qwen2.5:3b` trên GPU Vulkan, `NLLB-200 INT8`) đã có sẵn trong ổ cứng nên nạp thẳng offline chỉ mất vài giây.
-2. **Bước 2 — Thiết lập nhanh trước cuộc họp (Zoom / Google Meet / Teams):**
+   - Toàn bộ model (`Faster-Whisper large-v3-turbo-ct2`, `Ollama qwen2.5:3b` trên GPU Vulkan, `NLLB-200 INT8`) đã có sẵn trong ổ cứng nên nạp thẳng offline chỉ mất vài giây; đồng thời `BrowserBridgeServer` (`127.0.0.1:47863`) cũng tự động sẵn sàng đón kết nối từ Chrome Extension.
+2. **Bước 2 — Dịch Video Tại Chỗ trên Trình duyệt Chrome / Edge / Brave (`Alt+Shift+T`):**
+   - Mở `chrome://extensions/` $\rightarrow$ bấm nút **Reload (`⟳`)** trên tiện ích **Local AI Live Translator — Phụ đề Video** để nhận `yt_caption_hook.js` mới (hoặc bật **Developer mode** $\rightarrow$ **Load unpacked** trỏ vào [`chrome_extension`](./chrome_extension), ID cố định: `cgbbacpgahelimaelidkgmphgcbiclfd`).
+   - Mở bất kỳ tab có video (YouTube, Coursera, Udemy, v.v.) và nhấn **`Alt+Shift+T`**. Trên YouTube có phụ đề gốc/tự động, HUD sẽ hiện `⚡ Phụ đề gốc YT (EN · Chuẩn/Tự động) | Đón đầu: +90s` và khớp chuẩn từng câu theo thời gian video (tua tới đâu dịch ngay tới đó); nếu video không có phụ đề hoặc ở trang web khác, tiện ích tự động thu âm thanh tab dịch bằng Whisper như bình thường.
+3. **Bước 3 — Thiết lập nhanh trước cuộc họp (Zoom / Google Meet / Teams):**
    - Nhập tên dự án, tên khách hàng hoặc thuật ngữ chuyên ngành vào ô **`📚 Từ điển họp`** (ví dụ: `SLA, Kubernetes, Sprint, P&L -> Báo cáo lãi lỗ`).
    - Đảm bảo ô **`🔒 Ẩn khi Share màn hình`**, **`🛡️ Duyệt 1.5s (Esc hủy)`** và **`📝 Lưu biên bản`** đang được tích chọn.
    - Bấm **`▶ Bật Dịch Chiều Nghe`** để bắt đầu xem phụ đề song ngữ thời gian thực.
-3. **Bước 3 — Giao tiếp Chiều Nói (`F8` nói — `Esc` hủy) & Đấu nối Virtual Mic:**
+4. **Bước 4 — Giao tiếp Chiều Nói (`F8` nói — `Esc` hủy) & Đấu nối Virtual Mic:**
    - Để phát giọng tiếng Anh vào phòng họp: Cài driver **VB-Audio Virtual Cable** (`CABLE Input`), chọn `CABLE Output` làm Microphone trong Zoom/Meet và cắm Micro/Tai nghe vật lý cho PC.
    - Khi phát biểu: Giữ phím **`F8`** để nói tiếng Việt $\rightarrow$ thả **`F8`** $\rightarrow$ liếc nhanh câu tiếng Anh trên Overlay trong `1.5s` (bấm **`Esc`** nếu muốn hủy/nói lại).
    - Cuối buổi họp: Bấm **`📂 Mở biên bản`** để xem lại toàn bộ biên bản họp song ngữ trong thư mục `meeting_logs/`.
-4. **Nếu có bất kỳ vấn đề gì phát sinh:**
+5. **Nếu có bất kỳ vấn đề gì phát sinh:**
    - Chỉ cần nhắn cho AI: *"Đọc `PROGRESS.md` và `app_debug.log` để tiếp tục kiểm tra/triển khai"*.
 

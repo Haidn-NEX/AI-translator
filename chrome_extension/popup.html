@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <title>Local AI Live Translator</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <div class="title-row">
+      <span class="app-title">🎬 Dịch Video Tại Chỗ (Local AI)</span>
+      <span id="deviceBadge" class="device-badge">Local GPU</span>
+    </div>
+    <div id="statusLine" class="status-line">⚪ Đang tắt</div>
+  </div>
+
+  <button id="btnToggle" class="btn-toggle">
+    ▶ Bật dịch tab này <span class="shortcut-hint">(Alt+Shift+T)</span>
+  </button>
+
+  <div class="form-group">
+    <label for="sourceLang">Ngôn ngữ nguồn của video:</label>
+    <select id="sourceLang">
+      <option value="en">en (Tiếng Anh)</option>
+      <option value="auto">auto (Tự nhận diện)</option>
+      <option value="ja">ja (Tiếng Nhật)</option>
+      <option value="zh">zh (Tiếng Trung)</option>
+      <option value="ko">ko (Tiếng Hàn)</option>
+    </select>
+  </div>
+
+  <div class="form-group">
+    <label for="translationMode">Chế độ dịch thuật:</label>
+    <select id="translationMode">
+      <option value="ollama">Ollama LLM (Chuẩn ngữ cảnh)</option>
+      <option value="nllb_ct2">NLLB-200 INT8 (Siêu nhẹ, offline)</option>
+    </select>
+  </div>
+
+  <div class="checkbox-group">
+    <label class="chk-row">
+      <input type="checkbox" id="onlyVietnamese">
+      <span>👁️ Chỉ hiện Tiếng Việt (ẩn câu gốc)</span>
+    </label>
+    <label class="chk-row">
+      <input type="checkbox" id="saveTranscript" checked>
+      <span>📝 Lưu transcript (meeting_logs/video_*.md)</span>
+    </label>
+    <label class="chk-row">
+      <input type="checkbox" id="showHud" checked>
+      <span>📊 Hiện thông số trễ (HUD)</span>
+    </label>
+  </div>
+
+  <div class="form-group slider-group">
+    <div class="slider-header">
+      <label for="fontSize">Cỡ chữ Tiếng Việt:</label>
+      <span id="fontSizeVal">26 px</span>
+    </div>
+    <input type="range" id="fontSize" min="16" max="40" step="1" value="26">
+  </div>
+
+  <div class="summary-section">
+    <div class="summary-header">
+      <span class="summary-title">🧭 Ý chính đang bàn</span>
+      <button id="btnSummaryNow" class="btn-summary-now" title="Tổng hợp ngay các câu mới đang chờ">
+        🔄 Tổng hợp ngay
+      </button>
+    </div>
+
+    <div class="form-group">
+      <label for="summaryMode">Chế độ kích hoạt:</label>
+      <select id="summaryMode">
+        <option value="off">Tắt</option>
+        <option value="interval">⏱ Theo chu kỳ</option>
+        <option value="pause">⏸ Theo nhịp nghỉ</option>
+      </select>
+    </div>
+
+    <div class="summary-grid">
+      <div class="form-group">
+        <label id="summaryParamLabel" for="summaryParamVal">Mỗi (giây):</label>
+        <input type="number" id="summaryParamVal" min="15" max="90" step="5" value="30">
+      </div>
+      <div class="form-group">
+        <label for="summaryMinSentences">Tối thiểu câu:</label>
+        <input type="number" id="summaryMinSentences" min="1" max="8" step="1" value="3">
+      </div>
+    </div>
+
+    <label class="chk-row">
+      <input type="checkbox" id="showSummary" checked>
+      <span>📌 Hiện khung ý chính trên video</span>
+    </label>
+  </div>
+
+  <div class="footer">
+    <a href="#" id="openOptions">⚙️ Tùy chọn nâng cao & Từ điển thuật ngữ</a>
+  </div>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
+

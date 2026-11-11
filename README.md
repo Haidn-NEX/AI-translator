@@ -38,9 +38,26 @@ Dự án tuân thủ chuẩn tài liệu **Claude Harness** giúp mọi AI Codin
 ├── ARCHITECTURE.md              # Sơ đồ Mermaid kiến trúc, Sequence Diagram 2 chiều & Mô hình 6 luồng
 ├── README.md                    # Hướng dẫn cài đặt, cấu hình Virtual Cable & sử dụng
 ├── docs/
+│   ├── INTERPRETER_SUMMARY_SPEC.md # Đặc tả kỹ thuật Tầng 2 "Thư ký Hợp nhất Ý chính" (Interval vs Pause)
+│   ├── CHROME_EXTENSION_SPEC.md # Đặc tả kỹ thuật Chrome Extension "Dịch Video Tại Chỗ"
 │   ├── HARDWARE_AND_VRAM.md     # Phân tích phần cứng (GTX 1070 SM 6.1 INT8 vs M1 Pro) & VRAM
-│   └── EXTENSION_GUIDE.md       # Hướng dẫn mở rộng ngôn ngữ, đổi phím tắt, tinh chỉnh VAD/TTS
-├── main.py                      # Điều phối đa luồng (Incoming + Outgoing), Global Hotkey F8 & Control Panel
+│   └── EXTENSION_GUIDE.md       # Hướng dẫn mở rộng ngôn ngữ, nguồn âm thanh, tinh chỉnh VAD/TTS
+├── chrome_extension/            # Chrome Extension MV3 "Dịch Video Tại Chỗ" (Alt+Shift+T)
+│   ├── manifest.json            # Cấu hình MV3 (tabCapture, offscreen, nativeMessaging, cố định ID)
+│   ├── service_worker.js        # Điều phối tabCapture, tự gọi Native Host bật backend & đồng bộ token
+│   ├── offscreen.js             # AudioContext + AudioWorklet (pcm_worklet.js) + giữ nguyên tiếng tab
+│   ├── content_script.js        # Shadow DOM phụ đề bám theo thẻ <video>, hỗ trợ Fullscreen & kéo thả
+│   ├── subtitle_pacer.js        # Bộ điều tốc nhịp đọc phụ đề (port 1:1 từ overlay_ui.py)
+│   ├── popup.html / popup.js    # Giao diện điều khiển nhanh trên thanh công cụ Chrome
+│   └── options.html / options.js# Cài đặt cổng kết nối, cỡ chữ, độ mờ nền, từ điển chuyên ngành
+├── native_host/                 # Chrome Native Messaging Host tự động bật bridge_server.py ngầm
+│   ├── launcher.py              # Xử lý giao thức nhị phân stdio 4-byte LE (ensure_running, get_token, stop)
+│   └── install_native_host.ps1  # Script đăng ký Registry HKCU + Windows Scheduled Task
+├── main.py                      # Điều phối đa luồng (Desktop + Integrated Bridge), Global Hotkey F8 & Control Panel
+├── incoming_pipeline.py         # Luồng suy luận Chiều Nghe dùng chung (IncomingInferenceWorker, MeetingTranscriptLogger)
+├── interpreter_summary.py       # Luồng Thư ký Hợp nhất Ý chính (SummaryWorker, SummarySettings, Telemetry CSV)
+├── browser_bridge.py            # Máy chủ HTTP/WebSocket nội bộ (127.0.0.1:47863) & TabAudioVADWorker
+├── bridge_server.py             # Điểm vào chạy ngầm không cửa sổ (Headless) cho Chrome Extension
 ├── hardware_profile.py          # Tự động nhận diện OS, GPU (GTX 1070 vs M1 Pro) & chọn cấu hình tối ưu
 ├── audio_capture.py             # SystemAudioVADWorker (chiều nghe) & MicPushToTalkRecorder (chiều nói)
 ├── ai_engine.py                 # Quản lý STT + Dịch 2 chiều (EN<->VI) có khóa ưu tiên GPU (gpu_lock)
@@ -48,7 +65,8 @@ Dự án tuân thủ chuẩn tài liệu **Claude Harness** giúp mọi AI Codin
 ├── overlay_ui.py                # Giao diện PyQt6: Khung phụ đề xuyên thấu + Hiển thị kiểm tra chiều nói + HUD
 ├── requirements_win.txt         # Thư viện tối ưu cho Windows + CUDA (GTX 1070)
 ├── requirements_mac.txt         # Thư viện tối ưu cho macOS Apple Silicon (M1 Pro)
-├── setup_and_run.bat            # Script tự động cài đặt và khởi chạy trên Windows
+├── setup_and_run.bat            # Script tự động cài đặt và khởi chạy Desktop App trên Windows
+├── start_bridge.bat             # Script bật nhanh Bridge Server ngầm cho Chrome Extension
 └── setup_and_run.sh             # Script tự động cài đặt và khởi chạy trên macOS
 ```
 
@@ -91,4 +109,55 @@ chmod +x setup_and_run.sh
    - **Khi đối tác nói tiếng Anh:** Đọc phụ đề tiếng Việt trực tiếp trên khung Overlay (ngay cả khi bạn đang Share toàn màn hình, đối tác cũng không nhìn thấy khung này).
    - **Khi đến lượt bạn phát biểu:** Nhấn giữ phím **`F8`** trên bàn phím, nói câu tiếng Việt vào mic thật rồi thả phím **`F8`**. Khung Overlay sẽ hiện trước câu tiếng Anh trong **`1.5 giây`** để bạn kiểm tra nhanh: nếu hài lòng thì cứ để máy tự phát giọng tiếng Anh vào phòng họp; nếu muốn hủy hoặc nói lại, bấm ngay phím **`Esc`**.
    - **Sau buổi họp:** Bấm nút **`📂 Mở biên bản`** để mở file biên bản song ngữ có mốc thời gian trong thư mục `meeting_logs/`.
+
+---
+
+## Hướng dẫn Sử dụng với Chrome Extension ("Dịch Video Tại Chỗ" — `Alt+Shift+T`)
+
+Khi xem video học tập/hội thảo trên trình duyệt (YouTube, Coursera, Udemy, Vimeo, v.v.), bạn có thể dùng **Chrome Extension** để thu riêng âm thanh của đúng tab đang xem (không bị lẫn tiếng thông báo từ phần mềm khác) và hiển thị phụ đề song ngữ bám ngay bên trong khung hình `<video>` (kể cả khi phóng **Toàn màn hình / Fullscreen**):
+
+1. **Bước 1 — Nạp tiện ích vào Chrome / Edge / Brave (Chỉ làm 1 lần):**
+   - Mở địa chỉ `chrome://extensions/` (hoặc `edge://extensions/`).
+   - Bật công tắc **Developer mode (Chế độ dành cho nhà phát triển)** ở góc trên bên phải.
+   - Bấm nút **Load unpacked (Tải tiện ích đã giải nén)** và chọn thư mục `chrome_extension` trong dự án này.
+   - Nhờ khóa công khai cố định trong `manifest.json`, tiện ích sẽ luôn nhận ID cố định: `cgbbacpgahelimaelidkgmphgcbiclfd`.
+2. **Bước 2 — Đăng ký Native Host để Chrome tự động bật AI ngầm (Chỉ làm 1 lần):**
+   - Mở PowerShell tại thư mục dự án và chạy lệnh:
+     ```powershell
+     powershell -ExecutionPolicy Bypass -File .\native_host\install_native_host.ps1 -ExtensionId cgbbacpgahelimaelidkgmphgcbiclfd
+     ```
+   - *(Tuỳ chọn)* Bạn cũng có thể bật sẵn ứng dụng Desktop (`setup_and_run.bat`) hoặc chạy `start_bridge.bat` thủ công bất kỳ lúc nào.
+3. **Bước 3 — Bật phụ đề trực tiếp trên Video:**
+   - Mở bất kỳ tab có video (ví dụ YouTube) và nhấn tổ hợp phím **`Alt+Shift+T`** (hoặc bấm vào biểu tượng tiện ích trên thanh công cụ Chrome rồi chọn **`▶ Bật dịch tab này`**).
+   - Nếu ứng dụng Desktop chưa mở, Chrome sẽ tự động đánh thức tiến trình ngầm `bridge_server.py` (tự động tắt giải phóng VRAM sau 15 phút không dùng).
+   - **Phím tắt tiện lợi trên trình duyệt:**
+     - **`Alt+Shift+T`**: Bật / Tắt dịch cho tab hiện tại.
+     - **`Alt+Shift+S`**: Chuyển đổi nhanh giữa chế độ *Song ngữ (Ngoại ngữ + Tiếng Việt)* và *Chỉ hiện Tiếng Việt*.
+     - **`Alt+Shift+H`**: Ẩn / Hiện nhanh hộp phụ đề trên video.
+   - Bạn có thể nắm thanh **`⠿ Dịch Tại Chỗ`** ở góc hộp phụ đề để kéo thả đến vị trí bất kỳ trong khung video (vị trí được tự động nhớ riêng cho từng trang web), và toàn bộ nội dung video được tự động lưu biên bản vào `meeting_logs/video_YYYY-MM-DD_HH-MM-SS.md`.
+
+---
+
+## 🧭 Thử nghiệm Ý chính (Thư ký Hợp nhất Ý chính — Tầng 2)
+
+Bên cạnh phụ đề tức thời (Tầng 1), hệ thống cung cấp thẻ **`🧭 Ý chính đang bàn`** (Tầng 2) hoạt động song song với $0\text{ MB}$ VRAM phát sinh (chia sẻ cùng model `qwen2.5` ở `OLLAMA_NUM_CTX = 1024`, tự động nhường GPU tức thì khi có câu phụ đề mới cần dịch).
+
+### Cách chọn nhanh chế độ và tham số theo tình huống
+Bạn có thể đổi nóng ngay khi đang nghe (trên `ControlBar` của Desktop hoặc trong Popup của Chrome Extension) mà không cần khởi động lại:
+- **Diễn thuyết nhanh / YouTube nói liên tục không nghỉ:** Chọn **`⏱ Theo chu kỳ`** (`interval`), đặt **`Mỗi (giây) = 30s`**, **`Tối thiểu câu = 3`**.
+- **Họp đối thoại qua lại / Phỏng vấn / Hỏi đáp:** Chọn **`⏸ Theo nhịp nghỉ`** (`pause`), đặt **`Im lặng (giây) = 2.0s`**, **`Tối thiểu câu = 2`**.
+- **Cần chốt ý ngay lập tức trước khi bật mic trả lời:** Bấm nút **`🔄 Tổng hợp ngay`**.
+
+### Quy trình 4 kịch bản thực nghiệm để tự chọn chế độ mặc định phù hợp nhất
+1. **Kịch bản 1 (`meeting_logs/a.mp4` hoặc video quen thuộc — 3 phút đầu):** Chạy ở chế độ **`⏱ Theo chu kỳ (30s)`**, `Tối thiểu câu = 3`.
+2. **Kịch bản 2 (Cùng video đó — 3 phút tiếp theo):** Chuyển nóng sang **`⏸ Theo nhịp nghỉ (2.0s)`**, `Tối thiểu câu = 2`.
+3. **Kịch bản 3 (Video nói cực nhanh / tranh luận trên YouTube qua Chrome Extension):** Thử cả hai chế độ (`⏱ Theo chu kỳ` vs `⏸ Theo nhịp nghỉ`) ngay trong Popup của tiện ích để cảm nhận độ nhịp nhàng của thẻ góc trên-phải video.
+4. **Kịch bản 4 (Cuộc họp thực tế có dùng phím `F8` trả lời):** Kiểm tra xem dòng **`❓ [Câu hỏi của đối tác]`** trên bảng `🧭 Ý chính đang bàn` có giúp bạn nắm bắt câu hỏi và phản xạ bấm `F8` nhanh hơn không.
+
+Sau khi thử nghiệm, chạy lệnh sau để in bảng thống kê đối chiếu khách quan từ dữ liệu telemetry (`meeting_logs/summary_metrics_*.csv` & `app_debug.log`):
+```powershell
+.\venv\Scripts\python.exe tests\summarize_metrics.py
+```
+
+
 

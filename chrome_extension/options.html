@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <title>Tùy chọn — Local AI Live Translator</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      max-width: 720px;
+      margin: 28px auto;
+      padding: 0 20px;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: #0f172a;
+      color: #f1f5f9;
+      line-height: 1.5;
+    }
+    h1 {
+      font-size: 22px;
+      color: #38bdf8;
+      margin-bottom: 6px;
+    }
+    .subtitle {
+      color: #94a3b8;
+      font-size: 13.5px;
+      margin-bottom: 20px;
+    }
+    .card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 18px;
+      margin-bottom: 18px;
+    }
+    .card h2 {
+      font-size: 15.5px;
+      color: #ffd54a;
+      margin-top: 0;
+      margin-bottom: 12px;
+    }
+    .field {
+      margin-bottom: 14px;
+    }
+    .field label {
+      display: block;
+      font-weight: 600;
+      font-size: 13px;
+      color: #e2e8f0;
+      margin-bottom: 5px;
+    }
+    input[type="text"],
+    input[type="number"],
+    select,
+    textarea {
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid #475569;
+      background: #0f172a;
+      color: #f8fafc;
+      font-size: 13px;
+      font-family: inherit;
+    }
+    textarea {
+      min-height: 84px;
+      resize: vertical;
+    }
+    .inline-row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    .btn {
+      padding: 8px 14px;
+      border-radius: 6px;
+      border: none;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+      background: #0284c7;
+      color: #fff;
+      white-space: nowrap;
+    }
+    .btn.secondary {
+      background: #334155;
+    }
+    .btn:hover {
+      filter: brightness(1.1);
+    }
+    .status-box {
+      margin-top: 10px;
+      padding: 9px 12px;
+      border-radius: 6px;
+      background: #0f172a;
+      font-size: 12.5px;
+      color: #cbd5e1;
+      display: none;
+    }
+    .hint {
+      font-size: 12px;
+      color: #94a3b8;
+      margin-top: 4px;
+    }
+    code {
+      background: #0f172a;
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: #38bdf8;
+    }
+  </style>
+</head>
+<body>
+  <h1>⚙️ Tùy chọn Local AI Live Translator</h1>
+  <p class="subtitle">Cấu hình kết nối máy dịch cục bộ, từ điển thuật ngữ chuyên ngành và giao diện phụ đề trên video.</p>
+
+  <div class="card">
+    <h2>🔌 Kết nối Máy dịch Cục bộ (Local Bridge)</h2>
+    <div class="field">
+      <label for="portInput">Cổng Backend (127.0.0.1):</label>
+      <div class="inline-row">
+        <input type="number" id="portInput" min="1024" max="65535" value="47863">
+        <button id="btnCheckHealth" class="btn">🔌 Kiểm tra kết nối</button>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="tokenInput">Token bảo mật (tự động đồng bộ hoặc lấy từ file <code>bridge_token.txt</code>):</label>
+      <div class="inline-row">
+        <input type="text" id="tokenInput" placeholder="Tự động lấy khi kết nối máy dịch...">
+        <button id="btnFetchToken" class="btn secondary">🔑 Tự động lấy Token</button>
+      </div>
+    </div>
+
+    <div id="connStatus" class="status-box"></div>
+  </div>
+
+  <div class="card">
+    <h2>📚 Từ điển Thuật ngữ Dự án / Tên riêng (Custom Glossary)</h2>
+    <div class="field">
+      <label for="glossaryInput">Mồi từ vựng cho cả Whisper STT và Ollama LLM:</label>
+      <textarea id="glossaryInput" placeholder="VD: Kubernetes, SLA, OKR, NVIDIA, P&L -> Báo cáo lãi lỗ"></textarea>
+      <div class="hint">Ngăn cách bằng dấu phẩy hoặc xuống dòng. Hỗ trợ cú pháp <code>Thuật ngữ -> Nghĩa tiếng Việt</code> giống hệt trên ứng dụng Desktop.</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>🎨 Giao diện & Vị trí Khung Phụ đề</h2>
+    <div class="field">
+      <label for="overlayPosition">Vị trí mặc định trên video:</label>
+      <select id="overlayPosition">
+        <option value="bottom">Đáy video (Mặc định - cách đáy 11%)</option>
+        <option value="top">Đỉnh video (Cách đỉnh 8%)</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label for="bgOpacity">Độ đậm nền khung phụ đề (<span id="bgOpacityVal">62%</span>):</label>
+      <input type="range" id="bgOpacity" min="0.25" max="0.95" step="0.05" value="0.62" style="width:100%;">
+    </div>
+
+    <div class="inline-row">
+      <button id="btnResetPositions" class="btn secondary">↺ Đặt lại vị trí đã kéo trên mọi trang</button>
+      <span id="resetStatus" class="hint"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>⌨️ Phím tắt & Hướng dẫn Nhanh</h2>
+    <p class="hint">
+      • Bật/Tắt dịch tab hiện tại: <code>Alt+Shift+T</code><br>
+      • Ẩn/Hiện dòng phụ đề gốc: <code>Alt+Shift+S</code><br>
+      • Ẩn/Hiện khung phụ đề: <code>Alt+Shift+H</code><br>
+      • Đổi phím tắt tại trang của Chrome: <code>chrome://extensions/shortcuts</code><br>
+      • Cài đặt tự động bật máy dịch ngầm (Native Host): chạy PowerShell<br>
+      <code>.\native_host\install_native_host.ps1 -ExtensionId <span id="extIdLabel"></span></code>
+    </p>
+  </div>
+
+  <button id="btnSaveAll" class="btn" style="width: 100%; padding: 11px;">💾 Lưu toàn bộ thiết lập</button>
+  <div id="saveBanner" class="status-box"></div>
+
+  <script type="module" src="options.js"></script>
+</body>
+</html>
+

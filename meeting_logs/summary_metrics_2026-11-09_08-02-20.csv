@@ -1,0 +1,5 @@
+﻿ts,source,mode,trigger,sentences,input_chars,truncated,prompt_ms,total_ms,preempt_count,ok,error,new_points,has_question,gap_since_last_s
+1794186140.529,chrome,pause,pause,4,127,0,179.5,1743.3,0,1,,2,1,15.7
+1794186156.481,chrome,pause,pause,3,248,0,370.4,1235.9,0,1,,1,1,16.0
+1794186171.400,chrome,pause,pause,3,330,0,377.1,2621.4,0,1,,1,1,14.9
+1794186200.276,chrome,pause,pause,4,298,0,171.3,1188.7,1,1,,1,1,28.9
